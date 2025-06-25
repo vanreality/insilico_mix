@@ -39,7 +39,7 @@ def load_bed_file(bed_path: Path) -> int:
             usecols=[1, 2],
             names=["start", "end"],
         )
-        total_length = (bed_df["end"] - bed_df["start"]).sum()
+        total_length = (bed_df["end"].astype(int) - bed_df["start"].astype(int)).sum()
         if total_length <= 0:
             console.print("[bold red]Error: Total length from BED file is non-positive.[/bold red]")
             sys.exit(1)
