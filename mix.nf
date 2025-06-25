@@ -33,11 +33,10 @@ workflow {
             return [ new_meta, target_file, background_file, ff, depth ]
         }
 
-    ch_input.view()
 
-    // MIX(
-    //     ch_input,
-    //     file(params.dmr_bed),
-    //     file("${workflow.projectDir}/bin/mix.py")
-    // )
+    MIX(
+        ch_input,
+        file(params.dmr_bed),
+        file("${workflow.projectDir}/bin/mix.py")
+    )
 }
