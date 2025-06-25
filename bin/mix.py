@@ -183,8 +183,8 @@ def mix(
     console.print("Calculating number of reads to sample...")
 
     # Calculate average read lengths
-    avg_len_target = (target_df["end"] - target_df["start"]).mean()
-    avg_len_background = (background_df["end"] - background_df["start"]).mean()
+    avg_len_target = (target_df["end"].astype(int) - target_df["start"].astype(int)).mean()
+    avg_len_background = (background_df["end"].astype(int) - background_df["start"].astype(int)).mean()
 
     if avg_len_target <= 0 or avg_len_background <= 0:
         console.print("[bold red]Error: Average read length is non-positive. Check start/end columns.[/bold red]")
