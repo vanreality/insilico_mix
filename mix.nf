@@ -1,3 +1,5 @@
+#!/usr/bin/env nextflow
+
 include { MIX } from './modules/local/mix/main.nf'
 
 workflow {
@@ -24,16 +26,18 @@ workflow {
     ch_depths = Channel.fromList(depths)
 
     ch_input = ch_samples
-        .cross(ch_ffs)
-        .cross(ch_depths)
+        .combine(ch_ffs)
+        .combine(ch_depths)
         .map { meta, target_file, background_file, ff, depth ->
             def new_meta = meta + [ff: ff, depth: depth]
             return [ new_meta, target_file, background_file, ff, depth ]
         }
 
-    MIX(
-        ch_input,
-        file(params.dmr_bed),
-        file("${workflow.projectDir}/bin/mix.py")
-    )
+    ch_input.view()
+
+    // MIX(
+    //     ch_input,
+    //     file(params.dmr_bed),
+    //     file("${workflow.projectDir}/bin/mix.py")
+    // )
 }

@@ -1,5 +1,5 @@
 process MIX {
-    tag "$meta.id"
+    tag "${meta.id}_${meta.label}_${meta.ff}_${meta.depth}"
     
     input:
     tuple val(meta), path(target_file), path(background_file), val(ff), val(depth)
