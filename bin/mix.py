@@ -72,7 +72,7 @@ def load_reads_file(file_path: Path, progress: Progress) -> pd.DataFrame:
     task_id = progress.add_task(f"Loading [cyan]{file_path.name}[/cyan]", total=None)
     try:
         # Assuming the file is not excessively large to be read into memory
-        df = pd.read_csv(file_path, sep="\t", header=None)
+        df = pd.read_csv(file_path, sep="\t")
         progress.update(task_id, completed=1, total=1)
         progress.stop_task(task_id)
         progress.update(task_id, visible=False)
