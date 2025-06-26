@@ -174,9 +174,9 @@ def mix(
         console.print("[bold red]Error: Input files must have at least 3 columns (chr, start, end).[/bold red]")
         sys.exit(1)
     
-    col_map = {0: 'chr', 1: 'start', 2: 'end'}
-    target_df = target_df.rename(columns=col_map)
-    background_df = background_df.rename(columns=col_map)
+    # col_map = {0: 'chr', 1: 'start', 2: 'end'}
+    # target_df = target_df.rename(columns=col_map)
+    # background_df = background_df.rename(columns=col_map)
 
 
     # 3. Calculate reads to sample
@@ -223,6 +223,9 @@ def mix(
     # 5. Combine and write to Parquet
     console.print("Combining samples and writing to output file...")
     combined_df = pd.concat([sampled_target, sampled_background], ignore_index=True)
+
+    rename_map = {'text': 'seq'}
+    combined_df = combined_df.rename(columns=rename_map)
 
     # Ensure output directory exists
     output_prefix.parent.mkdir(parents=True, exist_ok=True)

@@ -39,16 +39,4 @@ workflow {
         file(params.dmr_bed),
         file("${workflow.projectDir}/bin/mix.py")
     )
-
-    MIX.out.mix_results
-        .map { meta, parquet_file ->
-            def final_parquet_path = "${params.outdir}/mix/${parquet_file.getName()}"
-            "${meta.id}\t${meta.label}\t${final_parquet_path}"
-        }
-        .collectFile(
-            name: "${params.outdir}/mix_meta.tsv",
-            newLine: true,
-            seed: 'sample\tlabel\tparquet\n'
-        )
-        .view()
 }
