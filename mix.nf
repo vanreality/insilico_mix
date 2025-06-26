@@ -42,14 +42,11 @@ workflow {
 
     MIX.out.mix_results
         .map { meta, parquet_file ->
-            [
-                sample: meta.id,
-                label: meta.label,
-                parquet: parquet_file.toString()
-            ]
+            def final_parquet_path = "${params.outdir}/mix/${parquet_file.getName()}"
+            "${meta.id}\t${meta.label}\t${final_parquet_path}"
         }
         .collectFile(
-            name: 'mix_meta.tsv',
+            name: "${params.outdir}/mix_meta.tsv",
             newLine: true,
             seed: 'sample\tlabel\tparquet\n'
         )
