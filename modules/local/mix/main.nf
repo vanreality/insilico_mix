@@ -18,7 +18,7 @@ process MIX {
         --ff ${ff} \\
         --depth ${depth} \\
         --bed ${bed_file} \\
-        --output ${meta.id}_${meta.label}_${ff.toString().split('.')[1]}_${depth} \\
+        --output ${meta.id}_${meta.label}_${ff.toString().replace('.', 'p')}_${depth} \\
         ${args}
     """
 }
