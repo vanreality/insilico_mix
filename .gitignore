@@ -1,3 +1,5 @@
 .nextflow/
 .vscode/
 .nextflow*
+images/
+work/

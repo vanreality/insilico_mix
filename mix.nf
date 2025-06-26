@@ -39,4 +39,19 @@ workflow {
         file(params.dmr_bed),
         file("${workflow.projectDir}/bin/mix.py")
     )
+
+    MIX.out.mix_results
+        .map { meta, parquet_file ->
+            [
+                sample: meta.id,
+                label: meta.label,
+                parquet: parquet_file.toString()
+            ]
+        }
+        .collectFile(
+            name: 'mix_meta.tsv',
+            newLine: true,
+            seed: 'sample\tlabel\tparquet\n'
+        )
+        .view()
 }
