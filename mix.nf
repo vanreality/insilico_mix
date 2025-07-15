@@ -36,7 +36,7 @@ workflow {
 
     MIX(
         ch_input,
-        file(params.dmr_bed),
+        file(params.vcf),
         file("${workflow.projectDir}/bin/mix.py")
     )
 }

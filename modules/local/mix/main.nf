@@ -3,7 +3,7 @@ process MIX {
     
     input:
     tuple val(meta), path(target_file, stageAs: 'target.input'), path(background_file, stageAs: 'background.input'), val(ff), val(depth)
-    path(bed_file)
+    path(vcf_file)
     path(script)
     
     output:
@@ -17,7 +17,7 @@ process MIX {
         --background ${background_file} \\
         --ff ${ff} \\
         --depth ${depth} \\
-        --bed ${bed_file} \\
+        --vcf ${vcf_file} \\
         --output ${meta.id}_${meta.label}_${ff.toString().replace('.', 'p')}_${depth} \\
         ${args}
     """
