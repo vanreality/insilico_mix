@@ -109,9 +109,11 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     """
     Generate simulated ML model probabilities for target and background reads.
     
-    The probabilities are generated to meet the specified model accuracy:
-    - Target reads: peak around 0.97
-    - Background reads: peak around 0.03
+    The probabilities are generated to meet the specified model accuracy with smooth
+    distributions across the full 0-1 range:
+    - Target reads: smooth distribution biased toward higher values (>0.5)
+    - Background reads: smooth distribution biased toward lower values (≤0.5)
+    - Classification threshold: 0.5
     - Overall accuracy matches model_acc parameter
     
     Args:
@@ -132,42 +134,60 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     total_reads = n_target + n_background
     correct_predictions = int(model_acc * total_reads)
     
-    # Calculate misclassifications
-    target_misclassified = max(0, n_target - correct_predictions + n_background - correct_predictions)
-    background_misclassified = total_reads - correct_predictions - target_misclassified
+    # Distribute correct predictions proportionally between target and background
+    # This ensures a more balanced approach to meeting accuracy requirements
+    if total_reads == 0:
+        return np.array([]), np.array([])
     
-    target_correct = n_target - target_misclassified
-    background_correct = n_background - background_misclassified
+    target_ratio = n_target / total_reads
+    background_ratio = n_background / total_reads
+    
+    # Calculate correct classifications for each type
+    target_correct = min(n_target, int(correct_predictions * target_ratio + 0.5))
+    background_correct = min(n_background, correct_predictions - target_correct)
+    
+    # Adjust if we haven't allocated enough correct predictions
+    remaining_correct = correct_predictions - target_correct - background_correct
+    if remaining_correct > 0:
+        if target_correct < n_target:
+            additional_target = min(remaining_correct, n_target - target_correct)
+            target_correct += additional_target
+            remaining_correct -= additional_target
+        if remaining_correct > 0 and background_correct < n_background:
+            background_correct += min(remaining_correct, n_background - background_correct)
+    
+    target_misclassified = n_target - target_correct
+    background_misclassified = n_background - background_correct
     
     # Generate probabilities for target reads
     target_probs = np.zeros(n_target)
     
-    # Correctly classified targets (prob > 0.5, peaked around 0.97)
+    # Correctly classified targets (prob > 0.5) - smooth distribution from 0.5 to 1.0
     if target_correct > 0:
-        # Use beta distribution with high values to peak around 0.97
-        target_probs[:target_correct] = np.random.beta(20, 1, target_correct) * 0.5 + 0.5
-        target_probs[:target_correct] = np.clip(target_probs[:target_correct], 0.5, 1.0)
+        # Use normal distribution centered at 0.75 with std 0.15, clipped to (0.5, 1.0]
+        target_probs[:target_correct] = np.random.normal(0.75, 0.15, target_correct)
+        target_probs[:target_correct] = np.clip(target_probs[:target_correct], 0.501, 1.0)
     
-    # Misclassified targets (prob <= 0.5)
+    # Misclassified targets (prob ≤ 0.5) - smooth distribution from 0.0 to 0.5
     if target_misclassified > 0:
-        # Use beta distribution to generate low probabilities
-        target_probs[target_correct:] = np.random.beta(1, 20, target_misclassified) * 0.5
+        # Use normal distribution centered at 0.25 with std 0.15, clipped to [0.0, 0.5]
+        target_probs[target_correct:] = np.random.normal(0.25, 0.15, target_misclassified)
         target_probs[target_correct:] = np.clip(target_probs[target_correct:], 0.0, 0.5)
     
     # Generate probabilities for background reads
     background_probs = np.zeros(n_background)
     
-    # Correctly classified background (prob <= 0.5, peaked around 0.03)
+    # Correctly classified background (prob ≤ 0.5) - smooth distribution from 0.0 to 0.5
     if background_correct > 0:
-        # Use beta distribution with low values to peak around 0.03
-        background_probs[:background_correct] = np.random.beta(1, 20, background_correct) * 0.5
+        # Use normal distribution centered at 0.25 with std 0.15, clipped to [0.0, 0.5]
+        background_probs[:background_correct] = np.random.normal(0.25, 0.15, background_correct)
         background_probs[:background_correct] = np.clip(background_probs[:background_correct], 0.0, 0.5)
     
-    # Misclassified background (prob > 0.5)
+    # Misclassified background (prob > 0.5) - smooth distribution from 0.5 to 1.0
     if background_misclassified > 0:
-        # Use beta distribution to generate high probabilities
-        background_probs[background_correct:] = np.random.beta(20, 1, background_misclassified) * 0.5 + 0.5
-        background_probs[background_correct:] = np.clip(background_probs[background_correct:], 0.5, 1.0)
+        # Use normal distribution centered at 0.75 with std 0.15, clipped to (0.5, 1.0]
+        background_probs[background_correct:] = np.random.normal(0.75, 0.15, background_misclassified)
+        background_probs[background_correct:] = np.clip(background_probs[background_correct:], 0.501, 1.0)
     
     # Shuffle to randomize order
     np.random.shuffle(target_probs)
