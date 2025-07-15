@@ -88,6 +88,7 @@ def extract_reads_from_bam(bam_path: str, progress: Progress, task_id: TaskID) -
                     'end': read.reference_end,
                     'text': read.query_sequence if read.query_sequence else "",
                     'name': read.query_name,
+                    'insert_size': read.template_length,
                 }
                 reads_data.append(read_data)
                 
@@ -273,7 +274,7 @@ def create_dataframe(reads_data: List[Dict[str, Any]], probabilities: np.ndarray
     df['prob_class_1'] = probabilities
     
     # Ensure correct column order
-    df = df[['chr', 'start', 'end', 'text', 'name', 'prob_class_1']]
+    df = df[['chr', 'start', 'end', 'text', 'name', 'prob_class_1', 'insert_size']]
     
     return df
 
