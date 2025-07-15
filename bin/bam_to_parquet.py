@@ -109,10 +109,9 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     """
     Generate simulated ML model probabilities for target and background reads.
     
-    The probabilities are generated to meet the specified model accuracy with smooth
-    distributions across the full 0-1 range:
-    - Target reads: smooth distribution biased toward higher values (>0.5)
-    - Background reads: smooth distribution biased toward lower values (≤0.5)
+    The probabilities are generated with bimodal distributions and flat regions:
+    - Target reads: peaks around 0.95 (correct) and 0.05 (misclassified), flat elsewhere
+    - Background reads: peaks around 0.05 (correct) and 0.95 (misclassified), flat elsewhere
     - Classification threshold: 0.5
     - Overall accuracy matches model_acc parameter
     
@@ -159,35 +158,89 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     target_misclassified = n_target - target_correct
     background_misclassified = n_background - background_correct
     
+    def generate_bimodal_probs(n_samples: int, peak_value: float, is_correct: bool) -> np.ndarray:
+        """
+        Generate bimodal distribution with one peak and flat background.
+        
+        Args:
+            n_samples: Number of samples to generate
+            peak_value: Center of the peak (0.05 or 0.95)
+            is_correct: True if this represents correct classification
+            
+        Returns:
+            Array of probabilities
+        """
+        if n_samples == 0:
+            return np.array([])
+        
+        # Proportion of samples that form the peak vs flat distribution
+        peak_proportion = 0.7  # 70% form the peak, 30% are flat
+        n_peak = int(n_samples * peak_proportion)
+        n_flat = n_samples - n_peak
+        
+        probs = np.zeros(n_samples)
+        
+        # Generate peaked distribution using normal distribution with small std
+        if n_peak > 0:
+            if peak_value <= 0.5:
+                # Lower peak (around 0.05)
+                peak_probs = np.random.normal(peak_value, 0.02, n_peak)
+                if is_correct:
+                    # For correct classification, must be ≤ 0.5
+                    probs[:n_peak] = np.clip(peak_probs, 0.0, 0.5)
+                else:
+                    # For misclassification, must be ≤ 0.5 but peaked around 0.05
+                    probs[:n_peak] = np.clip(peak_probs, 0.0, 0.5)
+            else:
+                # Higher peak (around 0.95)
+                peak_probs = np.random.normal(peak_value, 0.02, n_peak)
+                if is_correct:
+                    # For correct classification, must be > 0.5
+                    probs[:n_peak] = np.clip(peak_probs, 0.501, 1.0)
+                else:
+                    # For misclassification, must be > 0.5 but peaked around 0.95
+                    probs[:n_peak] = np.clip(peak_probs, 0.501, 1.0)
+        
+        # Generate flat distribution in the appropriate range
+        if n_flat > 0:
+            if is_correct:
+                if peak_value <= 0.5:
+                    # Correct classification for low peak: flat in [0.0, 0.5]
+                    probs[n_peak:] = np.random.uniform(0.0, 0.5, n_flat)
+                else:
+                    # Correct classification for high peak: flat in (0.5, 1.0]
+                    probs[n_peak:] = np.random.uniform(0.501, 1.0, n_flat)
+            else:
+                if peak_value <= 0.5:
+                    # Misclassification for low peak: flat in [0.0, 0.5]
+                    probs[n_peak:] = np.random.uniform(0.0, 0.5, n_flat)
+                else:
+                    # Misclassification for high peak: flat in (0.5, 1.0]
+                    probs[n_peak:] = np.random.uniform(0.501, 1.0, n_flat)
+        
+        return probs
+    
     # Generate probabilities for target reads
     target_probs = np.zeros(n_target)
     
-    # Correctly classified targets (prob > 0.5) - smooth distribution from 0.5 to 1.0
+    # Correctly classified targets (prob > 0.5) - peak around 0.95
     if target_correct > 0:
-        # Use normal distribution centered at 0.75 with std 0.15, clipped to (0.5, 1.0]
-        target_probs[:target_correct] = np.random.normal(0.75, 0.15, target_correct)
-        target_probs[:target_correct] = np.clip(target_probs[:target_correct], 0.501, 1.0)
+        target_probs[:target_correct] = generate_bimodal_probs(target_correct, 0.95, True)
     
-    # Misclassified targets (prob ≤ 0.5) - smooth distribution from 0.0 to 0.5
+    # Misclassified targets (prob ≤ 0.5) - peak around 0.05
     if target_misclassified > 0:
-        # Use normal distribution centered at 0.25 with std 0.15, clipped to [0.0, 0.5]
-        target_probs[target_correct:] = np.random.normal(0.25, 0.15, target_misclassified)
-        target_probs[target_correct:] = np.clip(target_probs[target_correct:], 0.0, 0.5)
+        target_probs[target_correct:] = generate_bimodal_probs(target_misclassified, 0.05, False)
     
     # Generate probabilities for background reads
     background_probs = np.zeros(n_background)
     
-    # Correctly classified background (prob ≤ 0.5) - smooth distribution from 0.0 to 0.5
+    # Correctly classified background (prob ≤ 0.5) - peak around 0.05
     if background_correct > 0:
-        # Use normal distribution centered at 0.25 with std 0.15, clipped to [0.0, 0.5]
-        background_probs[:background_correct] = np.random.normal(0.25, 0.15, background_correct)
-        background_probs[:background_correct] = np.clip(background_probs[:background_correct], 0.0, 0.5)
+        background_probs[:background_correct] = generate_bimodal_probs(background_correct, 0.05, True)
     
-    # Misclassified background (prob > 0.5) - smooth distribution from 0.5 to 1.0
+    # Misclassified background (prob > 0.5) - peak around 0.95
     if background_misclassified > 0:
-        # Use normal distribution centered at 0.75 with std 0.15, clipped to (0.5, 1.0]
-        background_probs[background_correct:] = np.random.normal(0.75, 0.15, background_misclassified)
-        background_probs[background_correct:] = np.clip(background_probs[background_correct:], 0.501, 1.0)
+        background_probs[background_correct:] = generate_bimodal_probs(background_misclassified, 0.95, False)
     
     # Shuffle to randomize order
     np.random.shuffle(target_probs)
