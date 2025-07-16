@@ -27,7 +27,8 @@ process MIX {
         --depth-max ${max_depth} \\
         --depth-step ${depth_step} \\
         --vcf ${vcf_file} \\
+        --output-prefix ${meta.id} \\
         ${args} \
-        > mix.log 2>&1
+        > ${meta.id}_mix.log 2>&1
     """
 }

@@ -56,6 +56,7 @@ class ReadMixtureSimulator:
         depth_min: int,
         depth_max: int,
         depth_step: int,
+        output_prefix: str,
         triploid_chr: Optional[str] = None
     ):
         """
@@ -71,6 +72,7 @@ class ReadMixtureSimulator:
             depth_min: Minimum depth
             depth_max: Maximum depth
             depth_step: Depth step size
+            output_prefix: Prefix for output files
             triploid_chr: Optional chromosome with triploid condition (1.5x fetal fraction)
         """
         self.target_file = target_file
@@ -82,6 +84,7 @@ class ReadMixtureSimulator:
         self.depth_min = depth_min
         self.depth_max = depth_max
         self.depth_step = depth_step
+        self.output_prefix = output_prefix
         self.triploid_chr = triploid_chr
         
         # Data containers
@@ -337,7 +340,7 @@ class ReadMixtureSimulator:
             output_df = pd.concat(mixed_reads, ignore_index=True)
             
             # Save to parquet file
-            output_file = f"{ff:.2f}_{depth}.parquet"
+            output_file = f"{self.output_prefix}_{ff:.2f}_{depth}.parquet"
             output_df.to_parquet(output_file, index=False)
             
     def _simulate_site_mixture(self, chrom: str, pos: int, ff: float, depth: int) -> List[pd.DataFrame]:
@@ -518,6 +521,12 @@ class ReadMixtureSimulator:
     help='Depth step size'
 )
 @click.option(
+    '--output-prefix',
+    required=True,
+    type=str,
+    help='Prefix for output files'
+)
+@click.option(
     '--triploid-chr',
     default=None,
     help='Chromosome with triploid condition (1.5x fetal fraction)'
@@ -532,6 +541,7 @@ def main(
     depth_min: int,
     depth_max: int,
     depth_step: int,
+    output_prefix: str,
     triploid_chr: Optional[str]
 ) -> None:
     """
@@ -565,6 +575,7 @@ def main(
     params_table.add_row("Target file", str(target))
     params_table.add_row("Background file", str(background))
     params_table.add_row("VCF file", str(vcf))
+    params_table.add_row("Output prefix", output_prefix)
     params_table.add_row("Fetal fraction range", f"{ff_min} - {ff_max} (step: {ff_step})")
     params_table.add_row("Depth range", f"{depth_min} - {depth_max} (step: {depth_step})")
     if triploid_chr:
@@ -584,6 +595,7 @@ def main(
             depth_min=depth_min,
             depth_max=depth_max,
             depth_step=depth_step,
+            output_prefix=output_prefix,
             triploid_chr=triploid_chr
         )
         
