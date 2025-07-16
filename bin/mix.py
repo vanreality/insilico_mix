@@ -1,476 +1,608 @@
-#!/usr/bin/env python
-"""In-silico read mixer.
+#!/usr/bin/env python3
+"""
+Read Mixture Simulation Tool
 
-This script mixes reads from a target and a background file based on variation
-sites defined in a VCF file. For each variation site, it groups reads that
-cover the site, generates simulated depth and fetal fraction using Poisson
-distributions, and samples reads accordingly.
-
-Supports multiple input formats: TXT, TSV, and Parquet files are automatically
-detected and handled appropriately. Parquet files are processed using polars
-for efficient loading.
+This script simulates read mixtures from fetal and maternal reads across different
+fetal fractions and depths, with support for triploid chromosomes and genotyping.
 """
 
+import os
 import sys
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional, Any
+from collections import defaultdict
+import logging
 
 import click
-import numpy as np
 import pandas as pd
-import polars as pl
+import numpy as np
+from scipy import stats
+from intervaltree import IntervalTree
 from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, BarColumn, TextColumn
+from rich.progress import Progress, TaskID, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
+from rich.table import Table
+from rich.logging import RichHandler
+from rich.panel import Panel
+from rich import print as rprint
 
+# Setup rich console and logging
 console = Console()
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(message)s",
+    datefmt="[%X]",
+    handlers=[RichHandler(console=console, rich_tracebacks=True)]
+)
+logger = logging.getLogger(__name__)
 
 
-def detect_file_format(file_path: Path) -> str:
-    """Detects the file format based on file extension.
+class ReadMixtureSimulator:
+    """
+    A class for simulating read mixtures from fetal and maternal genomic data.
     
-    Args:
-        file_path: The path to the file.
-        
-    Returns:
-        The detected format: 'parquet', 'tsv', or 'txt'.
+    This simulator handles loading genomic reads, building interval trees from VCF files,
+    intersecting reads with variant sites, and generating mixed read datasets with
+    specified fetal fractions and depths.
     """
-    suffix = file_path.suffix.lower()
-    if suffix == '.parquet':
-        return 'parquet'
-    elif suffix in ['.tsv', '.txt']:
-        return suffix[1:]  # Remove the dot
-    else:
-        # Default to txt for unknown extensions
-        console.print(f"[yellow]Warning: Unknown file extension '{suffix}'. Treating as txt format.[/yellow]")
-        return 'txt'
-
-
-def load_vcf_file(vcf_path: Path) -> pd.DataFrame:
-    """Loads a VCF file and extracts chromosome and position information.
-
-    Args:
-        vcf_path: The path to the VCF file.
-
-    Returns:
-        A DataFrame containing chromosome and position columns.
+    
+    def __init__(
+        self,
+        target_file: str,
+        background_file: str,
+        vcf_file: str,
+        ff_min: float,
+        ff_max: float,
+        ff_step: float,
+        depth_min: int,
+        depth_max: int,
+        depth_step: int,
+        triploid_chr: Optional[str] = None
+    ):
+        """
+        Initialize the ReadMixtureSimulator.
         
-    Raises:
-        SystemExit: If the file cannot be loaded or is empty.
-    """
-    try:
-        console.print(f"Loading VCF file from: [cyan]{vcf_path}[/cyan]")
-        vcf_df = pd.read_csv(
-            vcf_path,
-            sep="\t",
-            header=None,
-            comment="#",
-            usecols=[0, 1],
-            names=["chr", "pos"],
-        )
+        Args:
+            target_file: Path to parquet file with fetal reads
+            background_file: Path to parquet file with maternal reads
+            vcf_file: Path to VCF file with variant sites
+            ff_min: Minimum fetal fraction
+            ff_max: Maximum fetal fraction
+            ff_step: Fetal fraction step size
+            depth_min: Minimum depth
+            depth_max: Maximum depth
+            depth_step: Depth step size
+            triploid_chr: Optional chromosome with triploid condition (1.5x fetal fraction)
+        """
+        self.target_file = target_file
+        self.background_file = background_file
+        self.vcf_file = vcf_file
+        self.ff_min = ff_min
+        self.ff_max = ff_max
+        self.ff_step = ff_step
+        self.depth_min = depth_min
+        self.depth_max = depth_max
+        self.depth_step = depth_step
+        self.triploid_chr = triploid_chr
         
-        if vcf_df.empty:
-            console.print("[bold red]Error: VCF file is empty.[/bold red]")
-            sys.exit(1)
+        # Data containers
+        self.target_reads: Optional[pd.DataFrame] = None
+        self.background_reads: Optional[pd.DataFrame] = None
+        self.variant_sites: Optional[pd.DataFrame] = None
+        self.interval_trees: Dict[str, IntervalTree] = {}
+        self.target_pools: Dict[str, Dict[int, pd.DataFrame]] = defaultdict(dict)
+        self.background_pools: Dict[str, Dict[int, pd.DataFrame]] = defaultdict(dict)
+        self.background_genotypes: Dict[str, Dict[int, str]] = defaultdict(dict)
+        
+    def load_data(self) -> None:
+        """Load target reads, background reads, and variant sites from files."""
+        console.print("\n[bold blue]Loading input data...[/bold blue]")
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=console
+        ) as progress:
+            # Load target reads
+            task1 = progress.add_task("Loading target reads...", total=None)
+            try:
+                self.target_reads = pd.read_parquet(self.target_file)
+                logger.info(f"Loaded {len(self.target_reads):,} target reads")
+                progress.update(task1, completed=True)
+            except Exception as e:
+                logger.error(f"Failed to load target reads: {e}")
+                sys.exit(1)
             
-        # Ensure position is integer
-        vcf_df["pos"] = vcf_df["pos"].astype(int)
+            # Load background reads
+            task2 = progress.add_task("Loading background reads...", total=None)
+            try:
+                self.background_reads = pd.read_parquet(self.background_file)
+                logger.info(f"Loaded {len(self.background_reads):,} background reads")
+                progress.update(task2, completed=True)
+            except Exception as e:
+                logger.error(f"Failed to load background reads: {e}")
+                sys.exit(1)
+            
+            # Load VCF file
+            task3 = progress.add_task("Loading VCF file...", total=None)
+            try:
+                self.variant_sites = pd.read_csv(
+                    self.vcf_file,
+                    sep='\t',
+                    usecols=[0, 1, 3, 4],
+                    names=['chr', 'pos', 'ref', 'alt'],
+                    comment='#'
+                )
+                logger.info(f"Loaded {len(self.variant_sites):,} variant sites")
+                progress.update(task3, completed=True)
+            except Exception as e:
+                logger.error(f"Failed to load VCF file: {e}")
+                sys.exit(1)
         
-        # Remove duplicates
-        vcf_df = vcf_df.drop_duplicates()
+        # Validate required columns
+        self._validate_data()
         
-        console.print(f"Loaded [bold yellow]{len(vcf_df):,}[/bold yellow] variation sites")
-        return vcf_df
+    def _validate_data(self) -> None:
+        """Validate that required columns exist in the loaded data."""
+        required_cols = ['chr', 'start', 'end', 'text']
         
-    except FileNotFoundError:
-        console.print(f"[bold red]Error: VCF file not found at {vcf_path}[/bold red]")
-        sys.exit(1)
-    except pd.errors.EmptyDataError:
-        console.print(f"[bold red]Error: VCF file {vcf_path} is empty.[/bold red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[bold red]An error occurred while processing the VCF file: {e}[/bold red]")
-        sys.exit(1)
-
-
-def load_reads_file(file_path: Path, progress: Progress) -> pd.DataFrame:
-    """Loads a reads file (TXT/TSV/Parquet) into a pandas DataFrame.
-
-    Automatically detects the file format and loads accordingly.
-    For TXT/TSV: assumes tab-separated file.
-    For Parquet: uses polars for efficient loading, then converts to pandas.
-
-    Args:
-        file_path: The path to the read file.
-        progress: A rich Progress instance for displaying progress.
-
-    Returns:
-        A pandas DataFrame containing the read data.
+        for col in required_cols:
+            if col not in self.target_reads.columns:
+                logger.error(f"Missing required column '{col}' in target reads")
+                sys.exit(1)
+            if col not in self.background_reads.columns:
+                logger.error(f"Missing required column '{col}' in background reads")
+                sys.exit(1)
+                
+        logger.info("Data validation passed")
         
-    Raises:
-        SystemExit: If the file cannot be loaded or is empty.
-    """
-    task_id = progress.add_task(f"Loading [cyan]{file_path.name}[/cyan]", total=None)
-    file_format = detect_file_format(file_path)
-    
-    try:
-        if file_format == 'parquet':
-            # Use polars for efficient parquet reading
-            df_polars = pl.read_parquet(file_path)
-            df = df_polars.to_pandas()
-            console.print(f"  Loaded [cyan]{len(df):,}[/cyan] reads from parquet file")
+    def build_interval_trees(self) -> None:
+        """Build interval trees for each chromosome from variant sites."""
+        console.print("\n[bold blue]Building interval trees...[/bold blue]")
+        
+        chromosomes = self.variant_sites['chr'].unique()
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Building interval trees...", total=len(chromosomes))
+            
+            for chrom in chromosomes:
+                chrom_variants = self.variant_sites[self.variant_sites['chr'] == chrom]
+                tree = IntervalTree()
+                
+                for _, variant in chrom_variants.iterrows():
+                    # Use position as both start and end for point intervals
+                    tree[variant['pos']:variant['pos']+1] = {
+                        'pos': variant['pos'],
+                        'ref': variant['ref'],
+                        'alt': variant['alt']
+                    }
+                
+                self.interval_trees[chrom] = tree
+                progress.advance(task)
+                
+        logger.info(f"Built interval trees for {len(chromosomes)} chromosomes")
+        
+    def intersect_reads_with_sites(self) -> None:
+        """Intersect target and background reads with variant sites to build read pools."""
+        console.print("\n[bold blue]Intersecting reads with variant sites...[/bold blue]")
+        
+        chromosomes = list(self.interval_trees.keys())
+        total_sites = sum(len(tree) for tree in self.interval_trees.values())
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            task = progress.add_task("Processing chromosomes...", total=len(chromosomes))
+            
+            for chrom in chromosomes:
+                self._process_chromosome(chrom)
+                progress.advance(task)
+                
+        logger.info(f"Processed {total_sites:,} variant sites across {len(chromosomes)} chromosomes")
+        
+    def _process_chromosome(self, chrom: str) -> None:
+        """Process reads for a single chromosome."""
+        tree = self.interval_trees[chrom]
+        
+        # Filter reads for this chromosome
+        target_chrom_reads = self.target_reads[self.target_reads['chr'] == chrom]
+        background_chrom_reads = self.background_reads[self.background_reads['chr'] == chrom]
+        
+        for interval in tree:
+            pos = interval.data['pos']
+            
+            # Find overlapping target reads
+            target_overlaps = target_chrom_reads[
+                (target_chrom_reads['start'] <= pos) & 
+                (target_chrom_reads['end'] >= pos)
+            ].copy()
+            
+            # Find overlapping background reads
+            background_overlaps = background_chrom_reads[
+                (background_chrom_reads['start'] <= pos) & 
+                (background_chrom_reads['end'] >= pos)
+            ].copy()
+            
+            # Store in pools
+            self.target_pools[chrom][pos] = target_overlaps
+            self.background_pools[chrom][pos] = background_overlaps
+            
+            # Genotype background reads for this site
+            self._genotype_site(chrom, pos, interval.data)
+            
+    def _genotype_site(self, chrom: str, pos: int, variant_data: Dict[str, Any]) -> None:
+        """
+        Genotype a variant site using background reads.
+        
+        Args:
+            chrom: Chromosome name
+            pos: Position of the variant
+            variant_data: Dictionary containing ref and alt alleles
+        """
+        background_reads = self.background_pools[chrom][pos]
+        
+        if len(background_reads) == 0:
+            # No reads covering this site - assign random genotype
+            self.background_genotypes[chrom][pos] = np.random.choice(['0/0', '0/1', '1/1'])
+            return
+            
+        ref_allele = variant_data['ref']
+        alt_allele = variant_data['alt']
+        
+        # Count alleles based on sequence text
+        ref_count = 0
+        alt_count = 0
+        
+        for _, read in background_reads.iterrows():
+            sequence = read['text']
+            read_start = read['start']
+            
+            # Calculate position within the read sequence
+            seq_pos = pos - read_start
+            
+            if 0 <= seq_pos < len(sequence):
+                base = sequence[seq_pos].upper()
+                if base == ref_allele.upper():
+                    ref_count += 1
+                elif base == alt_allele.upper():
+                    alt_count += 1
+        
+        # Determine genotype based on allele frequencies
+        total_count = ref_count + alt_count
+        if total_count == 0:
+            genotype = '0/0'  # Default to homozygous reference
         else:
-            # Handle TXT/TSV files with pandas
-            separator = "\t" if file_format in ['tsv', 'txt'] else "\t"
-            df = pd.read_csv(file_path, sep=separator)
-            console.print(f"  Loaded [cyan]{len(df):,}[/cyan] reads from {file_format.upper()} file")
+            alt_freq = alt_count / total_count
+            if alt_freq < 0.2:
+                genotype = '0/0'
+            elif alt_freq > 0.8:
+                genotype = '1/1'
+            else:
+                genotype = '0/1'
+                
+        self.background_genotypes[chrom][pos] = genotype
         
-        progress.update(task_id, completed=1, total=1)
-        progress.stop_task(task_id)
-        progress.update(task_id, visible=False)
+    def simulate_mixtures(self) -> None:
+        """Simulate read mixtures across all fetal fraction and depth combinations."""
+        console.print("\n[bold blue]Simulating read mixtures...[/bold blue]")
         
-        if df.empty:
-            console.print(f"[bold red]Error: Input file {file_path} is empty.[/bold red]")
-            sys.exit(1)
+        # Generate parameter combinations
+        ff_values = np.arange(self.ff_min, self.ff_max + self.ff_step, self.ff_step)
+        depth_values = np.arange(self.depth_min, self.depth_max + self.depth_step, self.depth_step)
+        
+        total_combinations = len(ff_values) * len(depth_values)
+        
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+            TimeElapsedColumn(),
+            console=console
+        ) as progress:
+            main_task = progress.add_task("Simulating mixtures...", total=total_combinations)
             
-        # Ensure start and end columns are integers if they exist
-        if 'start' in df.columns and 'end' in df.columns:
-            df['start'] = df['start'].astype(int)
-            df['end'] = df['end'].astype(int)
+            for ff in ff_values:
+                for depth in depth_values:
+                    self._simulate_single_mixture(ff, depth)
+                    progress.advance(main_task)
+                    
+        logger.info(f"Generated {total_combinations} mixture files")
+        
+    def _simulate_single_mixture(self, ff: float, depth: int) -> None:
+        """
+        Simulate a single mixture with specified fetal fraction and depth.
+        
+        Args:
+            ff: Fetal fraction
+            depth: Target depth
+        """
+        mixed_reads = []
+        
+        for chrom in self.interval_trees:
+            for interval in self.interval_trees[chrom]:
+                pos = interval.data['pos']
+                mixed_reads.extend(self._simulate_site_mixture(chrom, pos, ff, depth))
+        
+        # Create output DataFrame
+        if mixed_reads:
+            output_df = pd.concat(mixed_reads, ignore_index=True)
             
-        return df
-        
-    except FileNotFoundError:
-        console.print(f"[bold red]Error: Reads file not found at {file_path}[/bold red]")
-        sys.exit(1)
-    except pd.errors.EmptyDataError:
-        console.print(f"[bold red]Error: Reads file {file_path} is empty.[/bold red]")
-        sys.exit(1)
-    except Exception as e:
-        console.print(f"[bold red]An error occurred while loading {file_path}: {e}[/bold red]")
-        sys.exit(1)
-
-
-def find_reads_covering_site(reads_df: pd.DataFrame, chromosome: str, position: int) -> pd.DataFrame:
-    """Finds reads that cover a specific genomic position.
-    
-    Args:
-        reads_df: DataFrame containing read information with chr, start, end columns.
-        chromosome: The chromosome of the variation site.
-        position: The genomic position of the variation site.
-        
-    Returns:
-        DataFrame containing reads that cover the specified position.
-    """
-    # Filter reads by chromosome and position overlap
-    covering_reads = reads_df[
-        (reads_df['chr'] == chromosome) & 
-        (reads_df['start'] <= position) & 
-        (reads_df['end'] >= position)
-    ]
-    return covering_reads.copy()
-
-
-def generate_simulated_parameters(vcf_df: pd.DataFrame, 
-                                base_depth: int, 
-                                base_ff: float, 
-                                triploid_chr: str = None,
-                                seed: int = 42) -> Tuple[Dict[Tuple[str, int], int], Dict[Tuple[str, int], float]]:
-    """Generates simulated depth and fetal fraction for each variation site using Poisson distribution.
-    
-    Args:
-        vcf_df: DataFrame containing variation sites.
-        base_depth: Base depth value for Poisson distribution.
-        base_ff: Base fetal fraction for simulation.
-        triploid_chr: Chromosome with triploid condition (1.4x fetal fraction multiplier).
-        seed: Random seed for reproducibility.
-        
-    Returns:
-        Tuple of (depth_dict, ff_dict) where keys are (chr, pos) tuples.
-    """
-    np.random.seed(seed)
-    
-    depth_dict = {}
-    ff_dict = {}
-    
-    for _, row in vcf_df.iterrows():
-        chr_pos = (row['chr'], row['pos'])
-        
-        # Generate simulated depth using Poisson distribution
-        simulated_depth = max(1, np.random.poisson(base_depth))
-        depth_dict[chr_pos] = simulated_depth
-        
-        # Generate simulated fetal fraction using Poisson distribution approach
-        # We simulate fetal and maternal read counts separately, then calculate fraction
-        expected_fetal_reads = base_ff * base_depth
-        expected_maternal_reads = (1 - base_ff) * base_depth
-        
-        simulated_fetal_reads = max(0, np.random.poisson(expected_fetal_reads))
-        simulated_maternal_reads = max(1, np.random.poisson(expected_maternal_reads))
-        
-        total_reads = simulated_fetal_reads + simulated_maternal_reads
-        simulated_ff = simulated_fetal_reads / total_reads if total_reads > 0 else 0.01
-        
-        # Apply triploid chromosome multiplier if applicable
-        if triploid_chr and row['chr'] == triploid_chr:
-            simulated_ff = min(0.99, simulated_ff * 1.4)
+            # Save to parquet file
+            output_file = f"{ff:.2f}_{depth}.parquet"
+            output_df.to_parquet(output_file, index=False)
             
-        # Ensure fetal fraction is within reasonable bounds
-        simulated_ff = max(0.001, min(0.999, simulated_ff))
-        ff_dict[chr_pos] = simulated_ff
-    
-    return depth_dict, ff_dict
-
-
-def sample_reads_for_site(target_covering: pd.DataFrame, 
-                         background_covering: pd.DataFrame,
-                         simulated_depth: int,
-                         simulated_ff: float,
-                         site_seed: int) -> pd.DataFrame:
-    """Samples reads for a specific variation site based on simulated depth and fetal fraction.
-    
-    Args:
-        target_covering: Target reads covering the site.
-        background_covering: Background reads covering the site.
-        simulated_depth: Simulated depth for this site.
-        simulated_ff: Simulated fetal fraction for this site.
-        site_seed: Random seed for this specific site.
+    def _simulate_site_mixture(self, chrom: str, pos: int, ff: float, depth: int) -> List[pd.DataFrame]:
+        """
+        Simulate mixture for a single site.
         
-    Returns:
-        DataFrame containing sampled reads for this site.
-    """
-    np.random.seed(site_seed)
-    
-    # Calculate number of reads needed from each source
-    n_target_needed = int(round(simulated_depth * simulated_ff))
-    n_background_needed = simulated_depth - n_target_needed
-    
-    sampled_reads = []
-    
-    # Sample target reads
-    if n_target_needed > 0 and len(target_covering) > 0:
-        replace_target = n_target_needed > len(target_covering)
+        Args:
+            chrom: Chromosome name
+            pos: Position
+            ff: Fetal fraction
+            depth: Target depth
+            
+        Returns:
+            List of DataFrames containing mixed reads
+        """
+        target_reads = self.target_pools[chrom][pos]
+        background_reads = self.background_pools[chrom][pos]
         
-        sampled_target = target_covering.sample(
-            n=n_target_needed,
-            replace=replace_target,
-            random_state=site_seed
-        )
-        sampled_reads.append(sampled_target)
-    
-    # Sample background reads with resampling if insufficient
-    if n_background_needed > 0 and len(background_covering) > 0:
-        replace_background = n_background_needed > len(background_covering)
+        # Adjust fetal fraction for triploid chromosome
+        actual_ff = ff
+        if self.triploid_chr and chrom == self.triploid_chr:
+            actual_ff = 1.5 * ff
+            
+        # Sample depth using Poisson distribution
+        sampled_depth = np.random.poisson(depth)
+        if sampled_depth <= 0:
+            return []
+            
+        # Calculate target and background read counts
+        target_count = int(actual_ff * sampled_depth)
+        background_count = sampled_depth - target_count
         
-        sampled_background = background_covering.sample(
-            n=n_background_needed,
-            replace=replace_background,
-            random_state=site_seed + 1  # Different seed for background
-        )
-        sampled_reads.append(sampled_background)
-    
-    if sampled_reads:
-        return pd.concat(sampled_reads, ignore_index=True)
-    else:
-        # Return empty DataFrame with same structure as one of the inputs
-        if len(target_covering) > 0:
-            return pd.DataFrame(columns=target_covering.columns)
-        elif len(background_covering) > 0:
-            return pd.DataFrame(columns=background_covering.columns)
-        else:
+        # Ensure non-negative counts
+        target_count = max(0, target_count)
+        background_count = max(0, background_count)
+        
+        selected_reads = []
+        
+        # Sample target reads
+        if target_count > 0 and len(target_reads) > 0:
+            if len(target_reads) >= target_count:
+                sampled_target = target_reads.sample(n=target_count, replace=False)
+            else:
+                sampled_target = target_reads.sample(n=target_count, replace=True)
+            selected_reads.append(sampled_target)
+            
+        # Sample background reads
+        if background_count > 0 and len(background_reads) > 0:
+            selected_background = self._sample_background_reads(
+                chrom, pos, background_reads, background_count
+            )
+            if not selected_background.empty:
+                selected_reads.append(selected_background)
+                
+        return selected_reads
+        
+    def _sample_background_reads(
+        self, 
+        chrom: str, 
+        pos: int, 
+        background_reads: pd.DataFrame, 
+        required_count: int
+    ) -> pd.DataFrame:
+        """
+        Sample background reads with genotype-based bias for realistic simulation.
+        
+        Args:
+            chrom: Chromosome name
+            pos: Position
+            background_reads: Available background reads
+            required_count: Number of reads needed
+            
+        Returns:
+            Sampled background reads
+        """
+        if len(background_reads) == 0:
             return pd.DataFrame()
+            
+        genotype = self.background_genotypes[chrom][pos]
+        
+        if len(background_reads) >= required_count:
+            # Sufficient reads available - simple random sampling
+            return background_reads.sample(n=required_count, replace=False)
+        else:
+            # Insufficient reads - sample with replacement and bias
+            if genotype == '0/0':
+                # Homozygous reference - prefer reads supporting reference
+                weights = self._calculate_read_weights(background_reads, pos, 'ref_bias')
+            elif genotype == '1/1':
+                # Homozygous alternate - prefer reads supporting alternate
+                weights = self._calculate_read_weights(background_reads, pos, 'alt_bias')
+            else:
+                # Heterozygous - balanced sampling
+                weights = None
+                
+            return background_reads.sample(
+                n=required_count, 
+                replace=True, 
+                weights=weights
+            )
+            
+    def _calculate_read_weights(
+        self, 
+        reads: pd.DataFrame, 
+        pos: int, 
+        bias_type: str
+    ) -> np.ndarray:
+        """
+        Calculate sampling weights for reads based on genotype bias.
+        
+        Args:
+            reads: DataFrame of reads
+            pos: Position
+            bias_type: Type of bias ('ref_bias' or 'alt_bias')
+            
+        Returns:
+            Array of weights for sampling
+        """
+        # For now, return uniform weights
+        # In a more sophisticated implementation, this would analyze
+        # the sequence content to assign weights
+        return np.ones(len(reads))
 
 
 @click.command()
 @click.option(
-    "--target",
-    "target_path",
-    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    '--target',
     required=True,
-    help="Path to the target reads file (TXT/TSV/Parquet).",
+    type=click.Path(exists=True, path_type=Path),
+    help='Parquet file with fetal reads'
 )
 @click.option(
-    "--background",
-    "background_path",
-    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    '--background',
     required=True,
-    help="Path to the background reads file (TXT/TSV/Parquet).",
+    type=click.Path(exists=True, path_type=Path),
+    help='Parquet file with maternal reads'
 )
 @click.option(
-    "--ff",
-    "fetal_fraction",
-    type=click.FloatRange(0.0, 1.0),
+    '--vcf',
     required=True,
-    help="Base fetal fraction (proportion of reads from target file).",
+    type=click.Path(exists=True, path_type=Path),
+    help='VCF file with variant sites'
 )
 @click.option(
-    "--depth",
-    type=click.IntRange(min=1),
+    '--ff-min',
     required=True,
-    help="Base average sequencing depth for Poisson sampling.",
+    type=float,
+    help='Minimum fetal fraction'
 )
 @click.option(
-    "--vcf",
-    "vcf_path",
-    type=click.Path(exists=True, dir_okay=False, readable=True, path_type=Path),
+    '--ff-max',
     required=True,
-    help="VCF file defining variation sites of interest.",
+    type=float,
+    help='Maximum fetal fraction'
 )
 @click.option(
-    "--output",
-    "output_prefix",
-    type=click.Path(writable=True, dir_okay=False, path_type=Path),
+    '--ff-step',
     required=True,
-    help="Prefix for the output Parquet file.",
+    type=float,
+    help='Fetal fraction step size'
 )
 @click.option(
-    "--triploid-chr",
-    type=str,
-    default=None,
-    help="Chromosome with triploid condition (1.4x fetal fraction multiplier).",
-)
-@click.option(
-    "--seed",
+    '--depth-min',
+    required=True,
     type=int,
-    default=42,
-    show_default=True,
-    help="Random seed for reproducibility.",
+    help='Minimum depth'
 )
-def mix(
-    target_path: Path,
-    background_path: Path,
-    fetal_fraction: float,
-    depth: int,
-    vcf_path: Path,
-    output_prefix: Path,
-    triploid_chr: str,
-    seed: int,
-):
-    """Generates an in-silico mixture of reads based on variation sites from a VCF file.
-    
-    This tool groups reads by variation sites, generates simulated depth and fetal
-    fraction for each site using Poisson distributions, and samples reads accordingly.
-    If a triploid chromosome is specified, the fetal fraction for that chromosome
-    is multiplied by 1.4.
+@click.option(
+    '--depth-max',
+    required=True,
+    type=int,
+    help='Maximum depth'
+)
+@click.option(
+    '--depth-step',
+    required=True,
+    type=int,
+    help='Depth step size'
+)
+@click.option(
+    '--triploid-chr',
+    default=None,
+    help='Chromosome with triploid condition (1.5x fetal fraction)'
+)
+def main(
+    target: Path,
+    background: Path,
+    vcf: Path,
+    ff_min: float,
+    ff_max: float,
+    ff_step: float,
+    depth_min: int,
+    depth_max: int,
+    depth_step: int,
+    triploid_chr: Optional[str]
+) -> None:
     """
-    console.print("[bold green]Starting read mixture process...[/bold green]")
-    np.random.seed(seed)
-
-    # 1. Load VCF file and get variation sites
-    vcf_df = load_vcf_file(vcf_path)
-
-    # 2. Load read files
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-        transient=True,
-    ) as progress:
-        console.print("Loading target and background read files...")
-        target_df = load_reads_file(target_path, progress)
-        background_df = load_reads_file(background_path, progress)
-
-    # Validate required columns
-    required_cols = ['chr', 'start', 'end']
-    for col in required_cols:
-        if col not in target_df.columns:
-            console.print(f"[bold red]Error: Target file missing required column '{col}'.[/bold red]")
-            sys.exit(1)
-        if col not in background_df.columns:
-            console.print(f"[bold red]Error: Background file missing required column '{col}'.[/bold red]")
-            sys.exit(1)
-
-    # 3. Generate simulated parameters for each variation site
-    console.print("Generating simulated depth and fetal fraction parameters...")
-    depth_dict, ff_dict = generate_simulated_parameters(
-        vcf_df, depth, fetal_fraction, triploid_chr, seed
-    )
+    Simulate read mixtures from fetal and maternal genomic data.
     
+    This tool generates mixed read datasets across different fetal fractions
+    and depths, with support for triploid chromosomes and genotyping-based
+    background read simulation.
+    """
+    # Display header
+    console.print(Panel.fit(
+        "[bold magenta]Read Mixture Simulator[/bold magenta]\n"
+        "Simulating fetal-maternal read mixtures",
+        title="🧬 Genomics Tool",
+        title_align="left"
+    ))
+    
+    # Validate parameters
+    if ff_min >= ff_max:
+        console.print("[red]Error: ff-min must be less than ff-max[/red]")
+        sys.exit(1)
+    if depth_min >= depth_max:
+        console.print("[red]Error: depth-min must be less than depth-max[/red]")
+        sys.exit(1)
+        
+    # Display parameters
+    params_table = Table(title="Simulation Parameters")
+    params_table.add_column("Parameter", style="cyan")
+    params_table.add_column("Value", style="magenta")
+    
+    params_table.add_row("Target file", str(target))
+    params_table.add_row("Background file", str(background))
+    params_table.add_row("VCF file", str(vcf))
+    params_table.add_row("Fetal fraction range", f"{ff_min} - {ff_max} (step: {ff_step})")
+    params_table.add_row("Depth range", f"{depth_min} - {depth_max} (step: {depth_step})")
     if triploid_chr:
-        triploid_sites = vcf_df[vcf_df['chr'] == triploid_chr]
-        console.print(f"Applied 1.4x fetal fraction multiplier to [yellow]{len(triploid_sites):,}[/yellow] sites on [cyan]{triploid_chr}[/cyan]")
-
-    # 4. Process each variation site and sample reads
-    console.print("Processing variation sites and sampling reads...")
-    all_sampled_reads = []
-    sites_with_no_coverage = 0
-    sites_processed = 0
+        params_table.add_row("Triploid chromosome", triploid_chr)
     
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        BarColumn(),
-        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-    ) as progress:
-        task_id = progress.add_task("Processing sites", total=len(vcf_df))
-        
-        for idx, (_, row) in enumerate(vcf_df.iterrows()):
-            chromosome = row['chr']
-            position = row['pos']
-            chr_pos = (chromosome, position)
-            
-            # Find reads covering this variation site
-            target_covering = find_reads_covering_site(target_df, chromosome, position)
-            background_covering = find_reads_covering_site(background_df, chromosome, position)
-            
-            if len(target_covering) == 0 and len(background_covering) == 0:
-                sites_with_no_coverage += 1
-                progress.update(task_id, advance=1)
-                continue
-            
-            # Get simulated parameters for this site
-            simulated_depth = depth_dict[chr_pos]
-            simulated_ff = ff_dict[chr_pos]
-            
-            # Sample reads for this site
-            sampled_reads = sample_reads_for_site(
-                target_covering, 
-                background_covering,
-                simulated_depth,
-                simulated_ff,
-                seed + idx  # Unique seed for each site
-            )
-            
-            if not sampled_reads.empty:
-                all_sampled_reads.append(sampled_reads)
-                sites_processed += 1
-            
-            progress.update(task_id, advance=1)
-
-    # 5. Report processing statistics
-    console.print(f"Processed [green]{sites_processed:,}[/green] sites successfully")
-    if sites_with_no_coverage > 0:
-        console.print(f"[yellow]Warning: {sites_with_no_coverage:,} sites had no read coverage and were skipped.[/yellow]")
-
-    # 6. Combine all sampled reads and write to Parquet
-    if not all_sampled_reads:
-        console.print("[bold red]Error: No reads were sampled. Check VCF file and read coverage.[/bold red]")
-        sys.exit(1)
+    console.print(params_table)
     
-    console.print("Combining samples and writing to output file...")
-    combined_df = pd.concat(all_sampled_reads, ignore_index=True)
-
-    # Rename text column to seq if it exists (for compatibility)
-    rename_map = {'text': 'seq'}
-    combined_df = combined_df.rename(columns=rename_map)
-
-    # Ensure output directory exists
-    output_prefix.parent.mkdir(parents=True, exist_ok=True)
-    output_path = output_prefix.with_suffix(".parquet")
-
     try:
-        combined_df.to_parquet(output_path, index=False)
-        console.print(f"[bold green]✔ Success![/bold green] Mixed reads file saved to: [cyan]{output_path}[/cyan]")
-        console.print(f"Total sampled reads: [bold yellow]{len(combined_df):,}[/bold yellow]")
+        # Initialize simulator
+        simulator = ReadMixtureSimulator(
+            target_file=str(target),
+            background_file=str(background),
+            vcf_file=str(vcf),
+            ff_min=ff_min,
+            ff_max=ff_max,
+            ff_step=ff_step,
+            depth_min=depth_min,
+            depth_max=depth_max,
+            depth_step=depth_step,
+            triploid_chr=triploid_chr
+        )
         
-        # Calculate some statistics
-        avg_depth_achieved = len(combined_df) / sites_processed if sites_processed > 0 else 0
-        console.print(f"Average depth achieved: [bold cyan]{avg_depth_achieved:.1f}[/bold cyan] reads per site")
+        # Execute simulation pipeline
+        simulator.load_data()
+        simulator.build_interval_trees()
+        simulator.intersect_reads_with_sites()
+        simulator.simulate_mixtures()
         
+        console.print("\n[bold green]✓ Simulation completed successfully![/bold green]")
+        
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Simulation interrupted by user[/yellow]")
+        sys.exit(1)
     except Exception as e:
-        console.print(f"[bold red]Failed to write Parquet file: {e}[/bold red]")
+        logger.error(f"Simulation failed: {e}")
+        console.print(f"\n[red]Error: {e}[/red]")
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    mix()
+if __name__ == '__main__':
+    main()

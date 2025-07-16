@@ -16,26 +16,14 @@ workflow {
             return [meta, target_file, background_file]
         }
 
-    def ffs = []
-    java.math.BigDecimal.valueOf(params.min_ff).step(java.math.BigDecimal.valueOf(params.max_ff), java.math.BigDecimal.valueOf(params.ff_step)) {
-        ffs.add(it.toFloat())
-    }
-    ch_ffs = Channel.fromList(ffs)
-
-    def depths = (params.min_depth..params.max_depth).step(params.depth_step).collect()
-    ch_depths = Channel.fromList(depths)
-
-    ch_input = ch_samples
-        .combine(ch_ffs)
-        .combine(ch_depths)
-        .map { meta, target_file, background_file, ff, depth ->
-            def new_meta = meta + [ff: ff, depth: depth]
-            return [ new_meta, target_file, background_file, ff, depth ]
-        }
-
-
     MIX(
-        ch_input,
+        ch_samples,
+        params.min_ff,
+        params.max_ff,
+        params.ff_step,
+        params.min_depth,
+        params.max_depth,
+        params.depth_step,
         file(params.vcf),
         file("${workflow.projectDir}/bin/mix.py")
     )
