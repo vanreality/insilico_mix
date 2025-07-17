@@ -1,26 +1,52 @@
 #!/usr/bin/env python3
 """
-BAM to Parquet Converter with ML Model Probability Simulation
+BAM to Parquet Converter with ML Model Probability Simulation (Optimized)
 
 This script processes target and background BAM files, extracts read information,
 simulates machine learning model probabilities, and outputs the data as parquet files.
+Optimized for large files with streaming, chunked processing, and multiprocessing.
 """
 
 import click
 import pandas as pd
 import pysam
 import numpy as np
+import psutil
+import gc
 from pathlib import Path
-from typing import Tuple, List, Dict, Any
+from typing import Tuple, List, Dict, Any, Iterator, Generator
+from concurrent.futures import ProcessPoolExecutor, as_completed
+from multiprocessing import cpu_count
+from functools import partial
 import sys
 import os
+import tempfile
+import shutil
 from rich.console import Console
-from rich.progress import Progress, TaskID, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn
+from rich.progress import Progress, TaskID, SpinnerColumn, BarColumn, TextColumn, TimeElapsedColumn, MofNCompleteColumn
 from rich.table import Table
 from rich import print as rprint
 from rich.panel import Panel
+from rich.text import Text
 
 console = Console()
+
+# Configuration constants for optimization
+DEFAULT_CHUNK_SIZE = 10000  # Number of reads per chunk
+DEFAULT_BATCH_SIZE = 50000  # Number of reads per batch for parquet writing
+MAX_WORKERS = min(cpu_count(), 8)  # Maximum number of worker processes
+MEMORY_THRESHOLD_GB = 2  # Memory threshold in GB to trigger garbage collection
+
+
+def get_memory_usage() -> float:
+    """
+    Get current memory usage in GB.
+    
+    Returns:
+        Current memory usage in gigabytes
+    """
+    process = psutil.Process(os.getpid())
+    return process.memory_info().rss / (1024 ** 3)
 
 
 def validate_bam_file(bam_path: str) -> bool:
@@ -50,17 +76,47 @@ def validate_bam_file(bam_path: str) -> bool:
         return False
 
 
-def extract_reads_from_bam(bam_path: str, progress: Progress, task_id: TaskID) -> List[Dict[str, Any]]:
+def count_reads_in_bam(bam_path: str) -> int:
     """
-    Extract read information from a BAM file.
+    Count total number of mapped reads in BAM file efficiently.
     
     Args:
         bam_path: Path to the BAM file
-        progress: Rich progress bar instance
-        task_id: Task ID for progress tracking
         
     Returns:
-        List of dictionaries containing read information
+        Total number of mapped reads
+        
+    Raises:
+        IOError: If the BAM file cannot be read
+    """
+    try:
+        with pysam.AlignmentFile(bam_path, "rb") as bam_file:
+            # Try to get count from index if available, otherwise count manually
+            try:
+                return bam_file.mapped
+            except:
+                # Fallback to manual counting
+                count = 0
+                for read in bam_file.fetch():
+                    if not read.is_unmapped:
+                        count += 1
+                return count
+    except Exception as e:
+        console.print(f"[red]Error counting reads in {bam_path}: {e}[/red]")
+        raise
+
+
+def extract_reads_chunk(bam_path: str, start_pos: int, chunk_size: int) -> List[Dict[str, Any]]:
+    """
+    Extract a chunk of reads from BAM file starting at a specific position.
+    
+    Args:
+        bam_path: Path to the BAM file
+        start_pos: Starting position (read number) in the file
+        chunk_size: Number of reads to extract
+        
+    Returns:
+        List of dictionaries containing read information for the chunk
         
     Raises:
         IOError: If the BAM file cannot be read
@@ -70,18 +126,21 @@ def extract_reads_from_bam(bam_path: str, progress: Progress, task_id: TaskID) -
     
     try:
         with pysam.AlignmentFile(bam_path, "rb") as bam_file:
-            # Count total reads first for progress tracking
-            total_reads = bam_file.count()
-            progress.update(task_id, total=total_reads)
+            current_pos = 0
+            reads_processed = 0
             
-            # Reset to beginning of file
-            bam_file.seek(0)
-            
-            for read_count, read in enumerate(bam_file.fetch()):
-                # Skip unmapped reads
-                if read.is_unmapped:
+            for read in bam_file.fetch():
+                # Skip to starting position
+                if current_pos < start_pos:
+                    current_pos += 1
                     continue
                 
+                # Skip unmapped reads
+                if read.is_unmapped:
+                    current_pos += 1
+                    continue
+                
+                # Extract read data
                 read_data = {
                     'chr': read.reference_name,
                     'start': read.reference_start,
@@ -92,23 +151,116 @@ def extract_reads_from_bam(bam_path: str, progress: Progress, task_id: TaskID) -
                 }
                 reads_data.append(read_data)
                 
-                # Update progress every 1000 reads
-                if read_count % 1000 == 0:
-                    progress.update(task_id, advance=1000)
-            
-            # Final progress update
-            progress.update(task_id, completed=total_reads)
-            
+                reads_processed += 1
+                current_pos += 1
+                
+                # Stop when chunk is complete
+                if reads_processed >= chunk_size:
+                    break
+                    
     except Exception as e:
-        console.print(f"[red]Error reading BAM file {bam_path}: {e}[/red]")
+        console.print(f"[red]Error reading chunk from BAM file {bam_path}: {e}[/red]")
         raise
     
     return reads_data
 
 
-def generate_probabilities(n_target: int, n_background: int, model_acc: float) -> Tuple[np.ndarray, np.ndarray]:
+def process_bam_chunk(args: Tuple[str, int, int, int]) -> Tuple[List[Dict[str, Any]], int]:
     """
-    Generate simulated ML model probabilities for target and background reads.
+    Process a single chunk of BAM file (for multiprocessing).
+    
+    Args:
+        args: Tuple containing (bam_path, start_pos, chunk_size, chunk_id)
+        
+    Returns:
+        Tuple of (reads_data, chunk_id)
+    """
+    bam_path, start_pos, chunk_size, chunk_id = args
+    reads_data = extract_reads_chunk(bam_path, start_pos, chunk_size)
+    return reads_data, chunk_id
+
+
+def extract_reads_from_bam_parallel(bam_path: str, progress: Progress, task_id: TaskID, 
+                                   chunk_size: int = DEFAULT_CHUNK_SIZE, 
+                                   max_workers: int = MAX_WORKERS) -> Iterator[List[Dict[str, Any]]]:
+    """
+    Extract read information from a BAM file using parallel processing and streaming.
+    
+    Args:
+        bam_path: Path to the BAM file
+        progress: Rich progress bar instance
+        task_id: Task ID for progress tracking
+        chunk_size: Number of reads per chunk
+        max_workers: Maximum number of worker processes
+        
+    Yields:
+        Chunks of read data as lists of dictionaries
+        
+    Raises:
+        IOError: If the BAM file cannot be read
+        ValueError: If the BAM file is corrupted or invalid
+    """
+    try:
+        # Count total reads for progress tracking
+        total_reads = count_reads_in_bam(bam_path)
+        progress.update(task_id, total=total_reads)
+        
+        # Calculate number of chunks needed
+        num_chunks = (total_reads + chunk_size - 1) // chunk_size
+        
+        # Create chunk arguments for parallel processing
+        chunk_args = [
+            (bam_path, i * chunk_size, chunk_size, i)
+            for i in range(num_chunks)
+        ]
+        
+        processed_reads = 0
+        
+        # Use ProcessPoolExecutor for parallel processing
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all chunks for processing
+            future_to_chunk = {
+                executor.submit(process_bam_chunk, args): args[3] 
+                for args in chunk_args
+            }
+            
+            # Process completed chunks in order
+            completed_chunks = {}
+            next_chunk_id = 0
+            
+            for future in as_completed(future_to_chunk):
+                try:
+                    reads_data, chunk_id = future.result()
+                    completed_chunks[chunk_id] = reads_data
+                    
+                    # Yield chunks in order
+                    while next_chunk_id in completed_chunks:
+                        chunk_data = completed_chunks.pop(next_chunk_id)
+                        if chunk_data:  # Only yield non-empty chunks
+                            yield chunk_data
+                            processed_reads += len(chunk_data)
+                            progress.update(task_id, completed=processed_reads)
+                        next_chunk_id += 1
+                        
+                        # Trigger garbage collection if memory usage is high
+                        if get_memory_usage() > MEMORY_THRESHOLD_GB:
+                            gc.collect()
+                            
+                except Exception as e:
+                    console.print(f"[red]Error processing chunk: {e}[/red]")
+                    raise
+            
+        # Final progress update
+        progress.update(task_id, completed=total_reads)
+        
+    except Exception as e:
+        console.print(f"[red]Error reading BAM file {bam_path}: {e}[/red]")
+        raise
+
+
+def generate_probabilities_streaming(n_target: int, n_background: int, model_acc: float) -> Tuple[Iterator[float], Iterator[float]]:
+    """
+    Generate simulated ML model probabilities for target and background reads using streaming.
     
     The probabilities are generated with bimodal distributions and flat regions:
     - Target reads: peaks around 0.95 (correct) and 0.05 (misclassified), flat elsewhere
@@ -122,7 +274,7 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
         model_acc: Model accuracy (between 0 and 1)
         
     Returns:
-        Tuple of (target_probabilities, background_probabilities)
+        Tuple of (target_probabilities_iterator, background_probabilities_iterator)
         
     Raises:
         ValueError: If model_acc is not between 0 and 1
@@ -135,9 +287,8 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     correct_predictions = int(model_acc * total_reads)
     
     # Distribute correct predictions proportionally between target and background
-    # This ensures a more balanced approach to meeting accuracy requirements
     if total_reads == 0:
-        return np.array([]), np.array([])
+        return iter([]), iter([])
     
     target_ratio = n_target / total_reads
     background_ratio = n_background / total_reads
@@ -159,119 +310,111 @@ def generate_probabilities(n_target: int, n_background: int, model_acc: float) -
     target_misclassified = n_target - target_correct
     background_misclassified = n_background - background_correct
     
-    def generate_bimodal_probs(n_samples: int, peak_value: float, is_correct: bool) -> np.ndarray:
+    def generate_bimodal_probs_stream(n_samples: int, peak_value: float, is_correct: bool) -> Iterator[float]:
         """
-        Generate bimodal distribution with one peak and flat background.
+        Generate bimodal distribution with one peak and flat background (streaming version).
         
         Args:
             n_samples: Number of samples to generate
             peak_value: Center of the peak (0.05 or 0.95)
             is_correct: True if this represents correct classification
             
-        Returns:
-            Array of probabilities
+        Yields:
+            Individual probability values
         """
         if n_samples == 0:
-            return np.array([])
+            return
+        
+        # Generate indices for peak vs flat distribution
+        indices = np.arange(n_samples)
+        np.random.shuffle(indices)
         
         # Proportion of samples that form the peak vs flat distribution
-        peak_proportion = 0.7  # 70% form the peak, 30% are flat
+        peak_proportion = 0.7
         n_peak = int(n_samples * peak_proportion)
-        n_flat = n_samples - n_peak
         
-        probs = np.zeros(n_samples)
+        peak_indices = set(indices[:n_peak])
         
-        # Generate peaked distribution using normal distribution with small std
-        if n_peak > 0:
-            if peak_value <= 0.5:
-                # Lower peak (around 0.05)
-                peak_probs = np.random.normal(peak_value, 0.02, n_peak)
-                if is_correct:
-                    # For correct classification, must be ≤ 0.5
-                    probs[:n_peak] = np.clip(peak_probs, 0.0, 0.5)
-                else:
-                    # For misclassification, must be ≤ 0.5 but peaked around 0.05
-                    probs[:n_peak] = np.clip(peak_probs, 0.0, 0.5)
-            else:
-                # Higher peak (around 0.95)
-                peak_probs = np.random.normal(peak_value, 0.02, n_peak)
-                if is_correct:
-                    # For correct classification, must be > 0.5
-                    probs[:n_peak] = np.clip(peak_probs, 0.501, 1.0)
-                else:
-                    # For misclassification, must be > 0.5 but peaked around 0.95
-                    probs[:n_peak] = np.clip(peak_probs, 0.501, 1.0)
-        
-        # Generate flat distribution in the appropriate range
-        if n_flat > 0:
-            if is_correct:
+        for i in range(n_samples):
+            if i in peak_indices:
+                # Generate peaked distribution
                 if peak_value <= 0.5:
-                    # Correct classification for low peak: flat in [0.0, 0.5]
-                    probs[n_peak:] = np.random.uniform(0.0, 0.5, n_flat)
+                    prob = np.random.normal(peak_value, 0.02)
+                    if is_correct:
+                        yield np.clip(prob, 0.0, 0.5)
+                    else:
+                        yield np.clip(prob, 0.0, 0.5)
                 else:
-                    # Correct classification for high peak: flat in (0.5, 1.0]
-                    probs[n_peak:] = np.random.uniform(0.501, 1.0, n_flat)
+                    prob = np.random.normal(peak_value, 0.02)
+                    if is_correct:
+                        yield np.clip(prob, 0.501, 1.0)
+                    else:
+                        yield np.clip(prob, 0.501, 1.0)
             else:
-                if peak_value <= 0.5:
-                    # Misclassification for low peak: flat in [0.0, 0.5]
-                    probs[n_peak:] = np.random.uniform(0.0, 0.5, n_flat)
+                # Generate flat distribution
+                if is_correct:
+                    if peak_value <= 0.5:
+                        yield np.random.uniform(0.0, 0.5)
+                    else:
+                        yield np.random.uniform(0.501, 1.0)
                 else:
-                    # Misclassification for high peak: flat in (0.5, 1.0]
-                    probs[n_peak:] = np.random.uniform(0.501, 1.0, n_flat)
+                    if peak_value <= 0.5:
+                        yield np.random.uniform(0.0, 0.5)
+                    else:
+                        yield np.random.uniform(0.501, 1.0)
+    
+    def target_prob_generator():
+        """Generate probabilities for target reads."""
+        # Correctly classified targets (prob > 0.5) - peak around 0.95
+        for prob in generate_bimodal_probs_stream(target_correct, 0.95, True):
+            yield prob
         
-        return probs
+        # Misclassified targets (prob ≤ 0.5) - peak around 0.05
+        for prob in generate_bimodal_probs_stream(target_misclassified, 0.05, False):
+            yield prob
     
-    # Generate probabilities for target reads
-    target_probs = np.zeros(n_target)
+    def background_prob_generator():
+        """Generate probabilities for background reads."""
+        # Correctly classified background (prob ≤ 0.5) - peak around 0.05
+        for prob in generate_bimodal_probs_stream(background_correct, 0.05, True):
+            yield prob
+        
+        # Misclassified background (prob > 0.5) - peak around 0.95
+        for prob in generate_bimodal_probs_stream(background_misclassified, 0.95, False):
+            yield prob
     
-    # Correctly classified targets (prob > 0.5) - peak around 0.95
-    if target_correct > 0:
-        target_probs[:target_correct] = generate_bimodal_probs(target_correct, 0.95, True)
+    # Shuffle the generators by creating lists and shuffling them
+    target_probs = list(target_prob_generator())
+    background_probs = list(background_prob_generator())
     
-    # Misclassified targets (prob ≤ 0.5) - peak around 0.05
-    if target_misclassified > 0:
-        target_probs[target_correct:] = generate_bimodal_probs(target_misclassified, 0.05, False)
-    
-    # Generate probabilities for background reads
-    background_probs = np.zeros(n_background)
-    
-    # Correctly classified background (prob ≤ 0.5) - peak around 0.05
-    if background_correct > 0:
-        background_probs[:background_correct] = generate_bimodal_probs(background_correct, 0.05, True)
-    
-    # Misclassified background (prob > 0.5) - peak around 0.95
-    if background_misclassified > 0:
-        background_probs[background_correct:] = generate_bimodal_probs(background_misclassified, 0.95, False)
-    
-    # Shuffle to randomize order
     np.random.shuffle(target_probs)
     np.random.shuffle(background_probs)
     
-    return target_probs, background_probs
+    return iter(target_probs), iter(background_probs)
 
 
-def create_dataframe(reads_data: List[Dict[str, Any]], probabilities: np.ndarray) -> pd.DataFrame:
+def create_dataframe_batch(reads_batch: List[Dict[str, Any]], probabilities_batch: List[float]) -> pd.DataFrame:
     """
-    Create a pandas DataFrame from reads data and probabilities.
+    Create a pandas DataFrame from a batch of reads data and probabilities.
     
     Args:
-        reads_data: List of dictionaries containing read information
-        probabilities: Array of probabilities for each read
+        reads_batch: List of dictionaries containing read information for the batch
+        probabilities_batch: List of probabilities for each read in the batch
         
     Returns:
-        DataFrame with columns ['chr', 'start', 'end', 'text', 'name', 'prob_class_1']
+        DataFrame with columns ['chr', 'start', 'end', 'text', 'name', 'prob_class_1', 'insert_size']
         
     Raises:
-        ValueError: If the lengths of reads_data and probabilities don't match
+        ValueError: If the lengths of reads_batch and probabilities_batch don't match
     """
-    if len(reads_data) != len(probabilities):
-        raise ValueError(f"Mismatch between reads data ({len(reads_data)}) and probabilities ({len(probabilities)})")
+    if len(reads_batch) != len(probabilities_batch):
+        raise ValueError(f"Mismatch between reads batch ({len(reads_batch)}) and probabilities batch ({len(probabilities_batch)})")
     
     # Create DataFrame from reads data
-    df = pd.DataFrame(reads_data)
+    df = pd.DataFrame(reads_batch)
     
     # Add probabilities
-    df['prob_class_1'] = probabilities
+    df['prob_class_1'] = probabilities_batch
     
     # Ensure correct column order
     df = df[['chr', 'start', 'end', 'text', 'name', 'prob_class_1', 'insert_size']]
@@ -279,13 +422,25 @@ def create_dataframe(reads_data: List[Dict[str, Any]], probabilities: np.ndarray
     return df
 
 
-def save_to_parquet(df: pd.DataFrame, output_path: str) -> None:
+def save_to_parquet_streaming(reads_chunks: Iterator[List[Dict[str, Any]]], 
+                            probabilities: Iterator[float], 
+                            output_path: str,
+                            progress: Progress,
+                            task_id: TaskID,
+                            batch_size: int = DEFAULT_BATCH_SIZE) -> int:
     """
-    Save DataFrame to parquet file.
+    Save streaming data to parquet file in batches for memory efficiency.
     
     Args:
-        df: DataFrame to save
+        reads_chunks: Iterator of read data chunks
+        probabilities: Iterator of probabilities
         output_path: Path for the output parquet file
+        progress: Rich progress bar instance
+        task_id: Task ID for progress tracking
+        batch_size: Number of reads per batch for writing
+        
+    Returns:
+        Total number of reads processed
         
     Raises:
         IOError: If the file cannot be written
@@ -296,42 +451,112 @@ def save_to_parquet(df: pd.DataFrame, output_path: str) -> None:
         if output_dir:
             os.makedirs(output_dir, exist_ok=True)
         
-        # Save to parquet with compression
-        df.to_parquet(output_path, compression='snappy', index=False)
-        console.print(f"[green]Successfully saved {len(df)} reads to {output_path}[/green]")
+        # Create temporary directory for batch files
+        temp_dir = tempfile.mkdtemp()
+        batch_files = []
+        total_reads = 0
+        
+        try:
+            current_batch = []
+            current_probs = []
+            batch_num = 0
+            
+            # Process chunks and create batches
+            for chunk in reads_chunks:
+                for read_data in chunk:
+                    try:
+                        prob = next(probabilities)
+                        current_batch.append(read_data)
+                        current_probs.append(prob)
+                        total_reads += 1
+                        
+                        # Write batch when it reaches target size
+                        if len(current_batch) >= batch_size:
+                            batch_df = create_dataframe_batch(current_batch, current_probs)
+                            batch_file = os.path.join(temp_dir, f"batch_{batch_num}.parquet")
+                            batch_df.to_parquet(batch_file, compression='snappy', index=False)
+                            batch_files.append(batch_file)
+                            
+                            # Clear batch data and trigger garbage collection
+                            current_batch.clear()
+                            current_probs.clear()
+                            del batch_df
+                            batch_num += 1
+                            
+                            if get_memory_usage() > MEMORY_THRESHOLD_GB:
+                                gc.collect()
+                            
+                            # Update progress
+                            progress.update(task_id, advance=batch_size)
+                            
+                    except StopIteration:
+                        break
+            
+            # Handle remaining reads in the last batch
+            if current_batch:
+                batch_df = create_dataframe_batch(current_batch, current_probs)
+                batch_file = os.path.join(temp_dir, f"batch_{batch_num}.parquet")
+                batch_df.to_parquet(batch_file, compression='snappy', index=False)
+                batch_files.append(batch_file)
+                progress.update(task_id, advance=len(current_batch))
+            
+            # Combine all batch files into final parquet file
+            if batch_files:
+                dfs = []
+                for batch_file in batch_files:
+                    df = pd.read_parquet(batch_file)
+                    dfs.append(df)
+                
+                # Concatenate all DataFrames
+                final_df = pd.concat(dfs, ignore_index=True)
+                final_df.to_parquet(output_path, compression='snappy', index=False)
+                
+                console.print(f"[green]Successfully saved {total_reads} reads to {output_path}[/green]")
+        
+        finally:
+            # Clean up temporary files
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        
+        return total_reads
         
     except Exception as e:
         console.print(f"[red]Error saving to parquet file {output_path}: {e}[/red]")
         raise
 
 
-def display_summary(target_df: pd.DataFrame, background_df: pd.DataFrame, model_acc: float) -> None:
+def display_summary(total_target: int, total_background: int, model_acc: float, 
+                   target_file: str, background_file: str) -> None:
     """
     Display a summary table of the processing results.
     
     Args:
-        target_df: DataFrame containing target reads
-        background_df: DataFrame containing background reads
+        total_target: Total number of target reads processed
+        total_background: Total number of background reads processed
         model_acc: Model accuracy used for simulation
+        target_file: Path to target output file
+        background_file: Path to background output file
     """
-    # Calculate actual accuracy
-    target_correct = (target_df['prob_class_1'] > 0.5).sum()
-    background_correct = (background_df['prob_class_1'] <= 0.5).sum()
-    total_reads = len(target_df) + len(background_df)
-    actual_acc = (target_correct + background_correct) / total_reads if total_reads > 0 else 0
+    total_reads = total_target + total_background
     
     # Create summary table
     table = Table(title="Processing Summary")
     table.add_column("Metric", style="cyan", no_wrap=True)
     table.add_column("Value", style="magenta")
     
-    table.add_row("Target reads", f"{len(target_df):,}")
-    table.add_row("Background reads", f"{len(background_df):,}")
+    table.add_row("Target reads", f"{total_target:,}")
+    table.add_row("Background reads", f"{total_background:,}")
     table.add_row("Total reads", f"{total_reads:,}")
     table.add_row("Expected accuracy", f"{model_acc:.3f}")
-    table.add_row("Actual accuracy", f"{actual_acc:.3f}")
-    table.add_row("Target prob range", f"{target_df['prob_class_1'].min():.3f} - {target_df['prob_class_1'].max():.3f}")
-    table.add_row("Background prob range", f"{background_df['prob_class_1'].min():.3f} - {background_df['prob_class_1'].max():.3f}")
+    table.add_row("Peak memory usage", f"{get_memory_usage():.2f} GB")
+    
+    # Add file size information
+    if os.path.exists(target_file):
+        target_size = os.path.getsize(target_file) / (1024 ** 2)  # MB
+        table.add_row("Target file size", f"{target_size:.2f} MB")
+    
+    if os.path.exists(background_file):
+        background_size = os.path.getsize(background_file) / (1024 ** 2)  # MB
+        table.add_row("Background file size", f"{background_size:.2f} MB")
     
     console.print(table)
 
@@ -345,11 +570,19 @@ def display_summary(target_df: pd.DataFrame, background_df: pd.DataFrame, model_
               help='Model accuracy (between 0 and 1)')
 @click.option('--output_dir', default='.', type=click.Path(), 
               help='Output directory for parquet files (default: current directory)')
-def main(target_bam: str, background_bam: str, model_acc: float, output_dir: str):
+@click.option('--chunk_size', default=DEFAULT_CHUNK_SIZE, type=int,
+              help=f'Number of reads per processing chunk (default: {DEFAULT_CHUNK_SIZE})')
+@click.option('--batch_size', default=DEFAULT_BATCH_SIZE, type=int,
+              help=f'Number of reads per batch for writing (default: {DEFAULT_BATCH_SIZE})')
+@click.option('--max_workers', default=MAX_WORKERS, type=int,
+              help=f'Maximum number of worker processes (default: {MAX_WORKERS})')
+def main(target_bam: str, background_bam: str, model_acc: float, output_dir: str,
+         chunk_size: int, batch_size: int, max_workers: int):
     """
-    Convert BAM files to parquet format with simulated ML model probabilities.
+    Convert BAM files to parquet format with simulated ML model probabilities (Optimized).
     
-    This script processes target and background BAM files, extracts read information,
+    This script processes target and background BAM files using streaming, chunked processing,
+    and multiprocessing for optimal performance with large files. It extracts read information,
     simulates machine learning model probabilities based on the specified accuracy,
     and outputs separate parquet files for target and background reads.
     
@@ -358,13 +591,37 @@ def main(target_bam: str, background_bam: str, model_acc: float, output_dir: str
         background_bam: Path to the background BAM file  
         model_acc: Model accuracy for probability simulation (0-1)
         output_dir: Output directory for parquet files
+        chunk_size: Number of reads per processing chunk
+        batch_size: Number of reads per batch for writing
+        max_workers: Maximum number of worker processes
     """
-    console.print(Panel.fit("[bold blue]BAM to Parquet Converter[/bold blue]"))
+    console.print(Panel.fit("[bold blue]BAM to Parquet Converter (Optimized)[/bold blue]"))
+    
+    # Display system information
+    system_info = Table(title="System Information")
+    system_info.add_column("Resource", style="cyan")
+    system_info.add_column("Value", style="magenta")
+    system_info.add_row("CPU cores", str(cpu_count()))
+    system_info.add_row("Available memory", f"{psutil.virtual_memory().available / (1024**3):.2f} GB")
+    system_info.add_row("Max workers", str(max_workers))
+    system_info.add_row("Chunk size", f"{chunk_size:,}")
+    system_info.add_row("Batch size", f"{batch_size:,}")
+    console.print(system_info)
+    console.print()
     
     try:
         # Validate model accuracy
         if not 0 <= model_acc <= 1:
             console.print("[red]Error: Model accuracy must be between 0 and 1[/red]")
+            sys.exit(1)
+        
+        # Validate chunk and batch sizes
+        if chunk_size <= 0 or batch_size <= 0:
+            console.print("[red]Error: Chunk size and batch size must be positive[/red]")
+            sys.exit(1)
+        
+        if max_workers <= 0:
+            console.print("[red]Error: Max workers must be positive[/red]")
             sys.exit(1)
         
         # Validate BAM files
@@ -381,49 +638,60 @@ def main(target_bam: str, background_bam: str, model_acc: float, output_dir: str
         target_output = os.path.join(output_dir, f"{target_prefix}.parquet")
         background_output = os.path.join(output_dir, f"{background_prefix}.parquet")
         
+        # Count reads for probability generation
+        console.print("[yellow]Counting reads for optimization...[/yellow]")
+        target_count = count_reads_in_bam(target_bam)
+        background_count = count_reads_in_bam(background_bam)
+        
+        console.print(f"[blue]Target reads: {target_count:,}[/blue]")
+        console.print(f"[blue]Background reads: {background_count:,}[/blue]")
+        console.print()
+        
         with Progress(
             SpinnerColumn(),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(),
+            MofNCompleteColumn(),
             TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
             TimeElapsedColumn(),
             console=console
         ) as progress:
             
-            # Extract reads from target BAM
-            target_task = progress.add_task("Processing target BAM...", total=None)
-            target_reads = extract_reads_from_bam(target_bam, progress, target_task)
-            
-            # Extract reads from background BAM
-            background_task = progress.add_task("Processing background BAM...", total=None)
-            background_reads = extract_reads_from_bam(background_bam, progress, background_task)
-            
             # Generate probabilities
             prob_task = progress.add_task("Generating probabilities...", total=100)
-            target_probs, background_probs = generate_probabilities(
-                len(target_reads), len(background_reads), model_acc
+            target_probs, background_probs = generate_probabilities_streaming(
+                target_count, background_count, model_acc
             )
             progress.update(prob_task, completed=100)
             
-            # Create DataFrames
-            df_task = progress.add_task("Creating DataFrames...", total=2)
-            target_df = create_dataframe(target_reads, target_probs)
-            progress.update(df_task, advance=1)
+            # Process target BAM
+            target_task = progress.add_task("Processing target BAM...", total=target_count)
+            target_chunks = extract_reads_from_bam_parallel(
+                target_bam, progress, target_task, chunk_size, max_workers
+            )
             
-            background_df = create_dataframe(background_reads, background_probs)
-            progress.update(df_task, advance=1)
+            # Save target data
+            save_target_task = progress.add_task("Saving target data...", total=target_count)
+            total_target_saved = save_to_parquet_streaming(
+                target_chunks, target_probs, target_output, progress, save_target_task, batch_size
+            )
             
-            # Save to parquet files
-            save_task = progress.add_task("Saving parquet files...", total=2)
-            save_to_parquet(target_df, target_output)
-            progress.update(save_task, advance=1)
+            # Process background BAM
+            background_task = progress.add_task("Processing background BAM...", total=background_count)
+            background_chunks = extract_reads_from_bam_parallel(
+                background_bam, progress, background_task, chunk_size, max_workers
+            )
             
-            save_to_parquet(background_df, background_output)
-            progress.update(save_task, advance=1)
+            # Save background data
+            save_background_task = progress.add_task("Saving background data...", total=background_count)
+            total_background_saved = save_to_parquet_streaming(
+                background_chunks, background_probs, background_output, progress, save_background_task, batch_size
+            )
         
         # Display summary
         console.print("\n")
-        display_summary(target_df, background_df, model_acc)
+        display_summary(total_target_saved, total_background_saved, model_acc, 
+                       target_output, background_output)
         
         console.print(f"\n[green]✓ Processing completed successfully![/green]")
         console.print(f"[blue]Output files:[/blue]")
