@@ -11,7 +11,6 @@ import click
 import pandas as pd
 import pysam
 import numpy as np
-import psutil
 import gc
 from pathlib import Path
 from typing import Tuple, List, Dict, Any, Iterator, Generator
@@ -35,18 +34,6 @@ console = Console()
 DEFAULT_CHUNK_SIZE = 10000  # Number of reads per chunk
 DEFAULT_BATCH_SIZE = 50000  # Number of reads per batch for parquet writing
 MAX_WORKERS = min(cpu_count(), 8)  # Maximum number of worker processes
-MEMORY_THRESHOLD_GB = 2  # Memory threshold in GB to trigger garbage collection
-
-
-def get_memory_usage() -> float:
-    """
-    Get current memory usage in GB.
-    
-    Returns:
-        Current memory usage in gigabytes
-    """
-    process = psutil.Process(os.getpid())
-    return process.memory_info().rss / (1024 ** 3)
 
 
 def validate_bam_file(bam_path: str) -> bool:
@@ -242,8 +229,8 @@ def extract_reads_from_bam_parallel(bam_path: str, progress: Progress, task_id: 
                             progress.update(task_id, completed=processed_reads)
                         next_chunk_id += 1
                         
-                        # Trigger garbage collection if memory usage is high
-                        if get_memory_usage() > MEMORY_THRESHOLD_GB:
+                        # Trigger periodic garbage collection
+                        if next_chunk_id % 10 == 0:  # Every 10 chunks
                             gc.collect()
                             
                 except Exception as e:
@@ -483,7 +470,8 @@ def save_to_parquet_streaming(reads_chunks: Iterator[List[Dict[str, Any]]],
                             del batch_df
                             batch_num += 1
                             
-                            if get_memory_usage() > MEMORY_THRESHOLD_GB:
+                            # Trigger periodic garbage collection
+                            if batch_num % 5 == 0:  # Every 5 batches
                                 gc.collect()
                             
                             # Update progress
@@ -547,7 +535,6 @@ def display_summary(total_target: int, total_background: int, model_acc: float,
     table.add_row("Background reads", f"{total_background:,}")
     table.add_row("Total reads", f"{total_reads:,}")
     table.add_row("Expected accuracy", f"{model_acc:.3f}")
-    table.add_row("Peak memory usage", f"{get_memory_usage():.2f} GB")
     
     # Add file size information
     if os.path.exists(target_file):
@@ -602,7 +589,6 @@ def main(target_bam: str, background_bam: str, model_acc: float, output_dir: str
     system_info.add_column("Resource", style="cyan")
     system_info.add_column("Value", style="magenta")
     system_info.add_row("CPU cores", str(cpu_count()))
-    system_info.add_row("Available memory", f"{psutil.virtual_memory().available / (1024**3):.2f} GB")
     system_info.add_row("Max workers", str(max_workers))
     system_info.add_row("Chunk size", f"{chunk_size:,}")
     system_info.add_row("Batch size", f"{batch_size:,}")
