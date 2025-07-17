@@ -33,7 +33,7 @@ console = Console()
 # Configuration constants for optimization
 DEFAULT_CHUNK_SIZE = 10000  # Number of reads per chunk
 DEFAULT_BATCH_SIZE = 50000  # Number of reads per batch for parquet writing
-MAX_WORKERS = min(cpu_count(), 8)  # Maximum number of worker processes
+MAX_WORKERS = min(cpu_count(), 16)  # Maximum number of worker processes
 
 
 def validate_bam_file(bam_path: str) -> bool:
