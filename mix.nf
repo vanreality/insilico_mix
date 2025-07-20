@@ -5,7 +5,7 @@ include { MIX } from './modules/local/mix/main.nf'
 workflow {
     ch_samples = Channel
         .fromPath(params.input_samplesheet)
-        .splitCsv(header: true, sep: '\t')
+        .splitCsv(header: true)
         .map { row ->
             def meta = [id: row.sample]
             def target_file = file(row.target_pileup)
