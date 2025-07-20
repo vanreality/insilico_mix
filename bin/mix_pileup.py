@@ -199,13 +199,13 @@ class PileupMixer:
         
         for _, row in self.filtered_background.iterrows():
             chr_pos = row['chr_pos']
-            af = row['cfDNA_alt_reads'] / row['current_depth']
+            vaf = row['cfDNA_alt_reads'] / row['current_depth']
             
             # Genotype based on VAF thresholds
-            if af < 0.3:
+            if vaf < 0.3:
                 genotype = '0/0'
                 alt_prob = 0.001  # No alternate alleles
-            elif af <= 0.7:
+            elif vaf <= 0.7:
                 genotype = '0/1'
                 alt_prob = 0.5  # 50% alternate alleles
             else:
@@ -215,7 +215,7 @@ class PileupMixer:
             genotype_counts[genotype] += 1
             
             self.background_genotypes[chr_pos] = {
-                'af': af,
+                'vaf': vaf,
                 'genotype': genotype,
                 'alt_prob': alt_prob,
                 'ref': row['ref'],
@@ -319,7 +319,7 @@ def mix_single_combination(args: Tuple) -> str:
         Output filename of the generated mixed pileup
     """
     try:
-        ff, depth, repeat_idx, mixer_data, factor, output_prefix = args
+        ff, depth, repeat_idx, mixer_data, factor, output_prefix, model_acc = args
         
         filtered_target, filtered_background, background_genotypes = mixer_data
         
@@ -373,6 +373,10 @@ def mix_single_combination(args: Tuple) -> str:
             final_ref = target_ref + background_ref
             final_alt = target_alt + background_alt
             final_depth = final_ref + final_alt
+
+            # Use model accuracy to classify target reads
+            fetal_ref = target_ref * model_acc + background_ref * (1 - model_acc)
+            fetal_alt = target_alt * model_acc + background_alt * (1 - model_acc)
             
             results.append({
                 'chr': row['chr'],
@@ -382,7 +386,9 @@ def mix_single_combination(args: Tuple) -> str:
                 'af': row['af'],
                 'cfDNA_ref_reads': final_ref,
                 'cfDNA_alt_reads': final_alt,
-                'current_depth': final_depth
+                'current_depth': final_depth,
+                'fetal_ref_reads_from_model': fetal_ref,
+                'fetal_alt_reads_from_model': fetal_alt
             })
         
         # Create output dataframe and save
@@ -419,10 +425,12 @@ def mix_single_combination(args: Tuple) -> str:
 @click.option('--output-prefix', required=True, help='Output directory prefix')
 @click.option('--threads', type=int, default=None, help='Number of threads (default: CPU count)')
 @click.option('--seed', type=int, default=42, help='Random seed for reproducibility')
+@click.option('--model-acc', type=float, default=0.81, help='Model accuracy for target reads classification')
 def main(target: str, background: str, tsv: str, factor: str,
          ff_min: float, ff_max: float, ff_number: int,
          depth_min: int, depth_max: int, depth_number: int,
-         repeat: int, output_prefix: str, threads: Optional[int], seed: int) -> None:
+         repeat: int, output_prefix: str, threads: Optional[int], seed: int, 
+         model_acc: float) -> None:
     """
     SNP Pileup Mixing Tool
     
@@ -464,7 +472,7 @@ def main(target: str, background: str, tsv: str, factor: str,
             for depth in depth_values:
                 for repeat_idx in range(repeat):
                     mixer_data = (mixer.filtered_target, mixer.filtered_background, mixer.background_genotypes)
-                    combinations.append((ff, depth, repeat_idx, mixer_data, factor, output_prefix))
+                    combinations.append((ff, depth, repeat_idx, mixer_data, factor, output_prefix, model_acc))
         
         total_combinations = len(combinations)
         console.print(f"[blue]Generating {total_combinations:,} mixed pileup files...[/blue]")

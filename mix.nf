@@ -4,27 +4,25 @@ include { MIX } from './modules/local/mix/main.nf'
 
 workflow {
     ch_samples = Channel
-        .fromPath(params.input_meta)
+        .fromPath(params.input_samplesheet)
         .splitCsv(header: true, sep: '\t')
         .map { row ->
-            def meta = [
-                id: row.sample,
-                label: row.label
-            ]
-            def target_file = file(row.target)
-            def background_file = file(row.background)
-            return [meta, target_file, background_file]
+            def meta = [id: row.sample]
+            def target_file = file(row.target_pileup)
+            def background_file = file(row.background_pileup)
+            def tsv_file = file(row.tsv)
+            def factor = row.factor
+            def min_ff = row.min_ff
+            def max_ff = row.max_ff
+            def ff_number = row.ff_number
+            def min_depth = row.min_depth
+            def max_depth = row.max_depth
+            def depth_number = row.depth_number
+            return [meta, target_file, background_file, tsv_file, factor, min_ff, max_ff, ff_number, min_depth, max_depth, depth_number]
         }
 
     MIX(
         ch_samples,
-        params.min_ff,
-        params.max_ff,
-        params.ff_step,
-        params.min_depth,
-        params.max_depth,
-        params.depth_step,
-        file(params.vcf),
         file("${workflow.projectDir}/bin/mix.py")
     )
 }
