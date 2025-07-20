@@ -375,8 +375,8 @@ def mix_single_combination(args: Tuple) -> str:
             final_depth = final_ref + final_alt
 
             # Use model accuracy to classify target reads
-            fetal_ref = target_ref * model_acc + background_ref * (1 - model_acc)
-            fetal_alt = target_alt * model_acc + background_alt * (1 - model_acc)
+            fetal_ref = int(target_ref * model_acc + background_ref * (1 - model_acc))
+            fetal_alt = int(target_alt * model_acc + background_alt * (1 - model_acc))
             
             results.append({
                 'chr': row['chr'],
