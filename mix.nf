@@ -24,6 +24,6 @@ workflow {
 
     MIX(
         ch_samples,
-        file("${workflow.projectDir}/bin/mix.py")
+        file("${workflow.projectDir}/bin/mix_pileup.py")
     )
 }
