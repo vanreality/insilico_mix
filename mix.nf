@@ -12,13 +12,14 @@ workflow {
             def background_file = file(row.background_pileup)
             def tsv_file = file(row.tsv)
             def factor = row.factor
-            def min_ff = row.min_ff
-            def max_ff = row.max_ff
+            def ff_min = row.ff_min
+            def ff_max = row.ff_max
             def ff_number = row.ff_number
-            def min_depth = row.min_depth
-            def max_depth = row.max_depth
+            def depth_min = row.depth_min
+            def depth_max = row.depth_max
             def depth_number = row.depth_number
-            return [meta, target_file, background_file, tsv_file, factor, min_ff, max_ff, ff_number, min_depth, max_depth, depth_number]
+            def repeat = row.repeat
+            return [meta, target_file, background_file, tsv_file, factor, ff_min, ff_max, ff_number, depth_min, depth_max, depth_number, repeat]
         }
 
     MIX(

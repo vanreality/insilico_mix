@@ -2,11 +2,11 @@ process MIX {
     tag "${meta.id}"
 
     input:
-    tuple val(meta), path(target_file), path(background_file), path(tsv_file), val(factor), val(min_ff), val(max_ff), val(ff_number), val(min_depth), val(max_depth), val(depth_number)
+    tuple val(meta), path(target_file), path(background_file), path(tsv_file), val(factor), val(min_ff), val(max_ff), val(ff_number), val(min_depth), val(max_depth), val(depth_number), val(repeat)
     path(script)
     
     output:
-    tuple val(meta), path("*_pileup.tsv.gz"), emit: mix_results
+    tuple val(meta), path("${meta.id}/*_pileup.tsv.gz"), emit: mix_results
     path("*.log"), emit: log
     
     script:
@@ -23,7 +23,8 @@ process MIX {
         --depth-min ${min_depth} \\
         --depth-max ${max_depth} \\
         --depth-number ${depth_number} \\
-        --output-prefix ./ \\
+        --repeat ${repeat} \\
+        --output-prefix ./${meta.id}/ \\
         ${args} \
         > ${meta.id}.log 2>&1
     """
