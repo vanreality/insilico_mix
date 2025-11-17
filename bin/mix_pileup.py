@@ -1,508 +1,543 @@
 #!/usr/bin/env python3
 """
-SNP Pileup Mixing Tool
+In silico mixing of pileup files.
 
-This module implements mixing of SNP pileup data from target and background samples
-to simulate various fetal fraction (ff) and sequencing depth combinations.
-
-The tool performs statistical sampling using hypergeometric distribution for target
-reads and beta-binomial distribution for background reads to create realistic
-mixed samples for downstream analysis.
+This script performs in silico mixing of two pileup files (target and background)
+to achieve a desired fetal fraction in the final mixture.
 """
 
 import gzip
-import logging
-import multiprocessing as mp
-import os
-import random
-from concurrent.futures import ProcessPoolExecutor, as_completed
+import sys
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Optional, Tuple
 
 import click
 import numpy as np
 import pandas as pd
 from rich.console import Console
-from rich.logging import RichHandler
-from rich.progress import Progress, TaskID
-from scipy.stats import hypergeom
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
 
 # Initialize rich console for formatted output
 console = Console()
 
-# Configure logging with rich handler
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(message)s",
-    handlers=[RichHandler(console=console)]
-)
-logger = logging.getLogger(__name__)
 
-
-class PileupMixer:
+def detect_gzip(filepath: str) -> bool:
     """
-    A class to handle SNP pileup mixing operations.
-    
-    This class manages the loading, filtering, and mixing of pileup data
-    from target and background samples to simulate various experimental
-    conditions.
-    """
-    
-    def __init__(self, target_file: str, background_file: str, snp_file: str):
-        """
-        Initialize the PileupMixer with input files.
-        
-        Args:
-            target_file: Path to target pileup file (tsv.gz format)
-            background_file: Path to background pileup file (tsv.gz format)
-            snp_file: Path to SNP sites file (tsv format)
-        
-        Raises:
-            FileNotFoundError: If any input file doesn't exist
-            ValueError: If file formats are invalid
-        """
-        self.target_file = Path(target_file)
-        self.background_file = Path(background_file)
-        self.snp_file = Path(snp_file)
-        
-        # Validate input files exist
-        for file_path in [self.target_file, self.background_file, self.snp_file]:
-            if not file_path.exists():
-                raise FileNotFoundError(f"Input file not found: {file_path}")
-        
-        self.target_df: Optional[pd.DataFrame] = None
-        self.background_df: Optional[pd.DataFrame] = None
-        self.snp_sites: Optional[pd.DataFrame] = None
-        self.filtered_target: Optional[pd.DataFrame] = None
-        self.filtered_background: Optional[pd.DataFrame] = None
-        self.background_genotypes: Optional[Dict] = None
-    
-    def load_data(self) -> None:
-        """
-        Load and validate all input data files.
-        
-        Raises:
-            ValueError: If data format is invalid or columns are missing
-        """
-        console.print("[blue]Loading input data...[/blue]")
-        
-        try:
-            # Load target pileup
-            self.target_df = pd.read_csv(
-                self.target_file,
-                sep='\t',
-                compression='gzip',
-                dtype={
-                    'ref': str,
-                    'alt': str,
-                    'af': float,
-                    'cfDNA_ref_reads': int,
-                    'cfDNA_alt_reads': int,
-                    'current_depth': int
-                }
-            )
-            
-            # Load background pileup
-            self.background_df = pd.read_csv(
-                self.background_file,
-                sep='\t',
-                compression='gzip',
-                dtype={
-                    'ref': str,
-                    'alt': str,
-                    'af': float,
-                    'cfDNA_ref_reads': int,
-                    'cfDNA_alt_reads': int,
-                    'current_depth': int
-                }
-            )
-            
-            # Load SNP sites
-            self.snp_sites = pd.read_csv(
-                self.snp_file,
-                sep='\t',
-                usecols=[0, 1],
-                names=['chr', 'pos'],
-                dtype={'chr': str, 'pos': int}
-            )
-            
-        except Exception as e:
-            raise ValueError(f"Error loading data files: {e}")
-        
-        # Validate required columns
-        required_pileup_cols = ['ref', 'alt', 'af', 'cfDNA_ref_reads', 'cfDNA_alt_reads', 'current_depth']
-        for df_name, df in [('target', self.target_df), ('background', self.background_df)]:
-            missing_cols = set(required_pileup_cols) - set(df.columns)
-            if missing_cols:
-                raise ValueError(f"Missing columns in {df_name} file: {missing_cols}")
-        
-        console.print(f"[green]✓[/green] Loaded {len(self.target_df):,} target records")
-        console.print(f"[green]✓[/green] Loaded {len(self.background_df):,} background records")
-        console.print(f"[green]✓[/green] Loaded {len(self.snp_sites):,} SNP sites")
-    
-    def filter_data(self) -> None:
-        """
-        Filter pileup data according to specified criteria.
-        
-        Filtering steps:
-        1. Keep only SNP sites of interest
-        2. Apply depth thresholds (>10 for target, >20 for background)
-        3. Keep only common SNP sites in both datasets
-        """
-        console.print("[blue]Filtering pileup data...[/blue]")
-        
-        # Add chr_pos identifier for filtering
-        self.target_df['chr_pos'] = self.target_df['chr'].astype(str) + '_' + self.target_df['pos'].astype(str)
-        self.background_df['chr_pos'] = self.background_df['chr'].astype(str) + '_' + self.background_df['pos'].astype(str)
-        self.snp_sites['chr_pos'] = self.snp_sites['chr'].astype(str) + '_' + self.snp_sites['pos'].astype(str)
-        
-        snp_set = set(self.snp_sites['chr_pos'])
-        
-        # Filter by SNP sites of interest
-        target_filtered = self.target_df[self.target_df['chr_pos'].isin(snp_set)].copy()
-        background_filtered = self.background_df[self.background_df['chr_pos'].isin(snp_set)].copy()
-        
-        console.print(f"[green]✓[/green] After SNP filtering: {len(target_filtered):,} target, {len(background_filtered):,} background")
-        
-        # Apply depth thresholds
-        target_filtered = target_filtered[target_filtered['current_depth'] > 10].copy()
-        background_filtered = background_filtered[background_filtered['current_depth'] > 20].copy()
-        
-        console.print(f"[green]✓[/green] After depth filtering: {len(target_filtered):,} target, {len(background_filtered):,} background")
-        
-        # Keep only common SNP sites
-        target_sites = set(target_filtered['chr_pos'])
-        background_sites = set(background_filtered['chr_pos'])
-        common_sites = target_sites & background_sites
-        
-        self.filtered_target = target_filtered[target_filtered['chr_pos'].isin(common_sites)].copy()
-        self.filtered_background = background_filtered[background_filtered['chr_pos'].isin(common_sites)].copy()
-        
-        console.print(f"[green]✓[/green] Final filtered data: {len(common_sites):,} common SNP sites")
-        
-        if len(common_sites) == 0:
-            raise ValueError("No common SNP sites found after filtering")
-    
-    def genotype_background(self) -> None:
-        """
-        Pre-genotype background data using VAF thresholds.
-        
-        This method classifies each SNP site into genotypes based on VAF:
-        - 0/0 (homozygous reference): VAF < 0.2
-        - 0/1 (heterozygous): 0.2 ≤ VAF ≤ 0.8
-        - 1/1 (homozygous alternate): VAF > 0.8
-        """
-        console.print("[blue]Genotyping background data using VAF thresholds...[/blue]")
-        
-        self.background_genotypes = {}
-        genotype_counts = {'0/0': 0, '0/1': 0, '1/1': 0}
-        
-        for _, row in self.filtered_background.iterrows():
-            chr_pos = row['chr_pos']
-            vaf = row['cfDNA_alt_reads'] / row['current_depth']
-            
-            # Genotype based on VAF thresholds
-            if vaf < 0.3:
-                genotype = '0/0'
-                alt_prob = 0.001  # No alternate alleles
-            elif vaf <= 0.7:
-                genotype = '0/1'
-                alt_prob = 0.5  # 50% alternate alleles
-            else:
-                genotype = '1/1'
-                alt_prob = 0.999  # All alternate alleles
-            
-            genotype_counts[genotype] += 1
-            
-            self.background_genotypes[chr_pos] = {
-                'vaf': vaf,
-                'genotype': genotype,
-                'alt_prob': alt_prob,
-                'ref': row['ref'],
-                'alt': row['alt']
-            }
-        
-        console.print(f"[green]✓[/green] Generated genotypes for {len(self.background_genotypes):,} background sites")
-        console.print(f"[green]✓[/green] Genotype distribution: 0/0={genotype_counts['0/0']:,}, 0/1={genotype_counts['0/1']:,}, 1/1={genotype_counts['1/1']:,}")
-
-
-def sample_target_reads(row: pd.Series, target_reads: int) -> Tuple[int, int]:
-    """
-    Sample target reads using hypergeometric distribution.
+    Detect if a file is gzipped by checking the file extension.
     
     Args:
-        row: Row from filtered target dataframe
-        target_reads: Number of target reads to sample
-    
+        filepath: Path to the file to check.
+        
     Returns:
-        Tuple of (ref_reads, alt_reads)
+        True if the file appears to be gzipped (has .gz extension), False otherwise.
     """
-    total_reads = row['current_depth_target']
-    ref_reads_orig = row['cfDNA_ref_reads_target']
+    return str(filepath).endswith('.gz')
+
+
+def read_pileup(filepath: str) -> pd.DataFrame:
+    """
+    Read a pileup file (plain or gzipped) into a pandas DataFrame.
     
-    # Use hypergeometric distribution to sample
-    # Population: total_reads, successes: ref_reads_orig, sample size: target_reads
+    The function automatically detects if the file is gzipped based on the
+    file extension and reads it accordingly.
+    
+    Args:
+        filepath: Path to the pileup file (plain or .gz).
+        
+    Returns:
+        DataFrame containing the pileup data with columns:
+        chr, pos, ref, alt, af, cfDNA_ref_reads, cfDNA_alt_reads, current_depth.
+        
+    Raises:
+        FileNotFoundError: If the file does not exist.
+        ValueError: If the file is empty or missing required columns.
+    """
+    if not Path(filepath).exists():
+        raise FileNotFoundError(f"File not found: {filepath}")
+    
+    # Determine if file is gzipped and open accordingly
+    if detect_gzip(filepath):
+        open_func = gzip.open
+        mode = 'rt'  # text mode for gzip
+    else:
+        open_func = open
+        mode = 'r'
+    
     try:
-        # Validate hypergeometric parameters before sampling
-        if target_reads > total_reads or ref_reads_orig > total_reads or ref_reads_orig < 0:
-            raise ValueError("Invalid hypergeometric parameters")
-        
-        ref_sampled = hypergeom.rvs(total_reads, ref_reads_orig, target_reads)
-        alt_sampled = target_reads - ref_sampled
-        return max(0, ref_sampled), max(0, alt_sampled)
-    except (ValueError, OverflowError) as e:
-        # Fallback to proportional sampling
-        ref_prop = ref_reads_orig / total_reads if total_reads > 0 else 0.5
-        ref_sampled = int(target_reads * ref_prop)
-        alt_sampled = target_reads - ref_sampled
-        return max(0, ref_sampled), max(0, alt_sampled)
+        with open_func(filepath, mode) as f:
+            df = pd.read_csv(f, sep='\t', dtype={
+                'chr': str,
+                'pos': int,
+                'ref': str,
+                'alt': str,
+                'af': float,
+                'cfDNA_ref_reads': int,
+                'cfDNA_alt_reads': int,
+                'current_depth': int
+            })
+    except Exception as e:
+        raise ValueError(f"Error reading pileup file {filepath}: {e}")
+    
+    # Validate required columns are present
+    required_columns = [
+        'chr', 'pos', 'ref', 'alt', 'af',
+        'cfDNA_ref_reads', 'cfDNA_alt_reads', 'current_depth'
+    ]
+    missing_columns = [col for col in required_columns if col not in df.columns]
+    if missing_columns:
+        raise ValueError(
+            f"Missing required columns in {filepath}: {missing_columns}"
+        )
+    
+    if df.empty:
+        raise ValueError(f"Empty pileup file: {filepath}")
+    
+    return df
 
 
-def sample_background_reads(genotype_info: Dict, background_reads: int) -> Tuple[int, int]:
+def merge_pileups(
+    target_df: pd.DataFrame,
+    background_df: pd.DataFrame
+) -> pd.DataFrame:
     """
-    Sample background reads using binomial distribution based on genotype.
-    For 0/1 genotypes, adds variance by sampling probability from beta distribution.
+    Merge target and background pileup DataFrames on key SNP columns.
+    
+    Performs an inner join on the five key columns (chr, pos, ref, alt, af)
+    to keep only SNPs present in both files. Renames columns to distinguish
+    between target and background data.
     
     Args:
-        genotype_info: Dictionary containing genotype information with alt_prob
-        background_reads: Number of background reads to sample
-    
+        target_df: DataFrame containing target pileup data.
+        background_df: DataFrame containing background pileup data.
+        
     Returns:
-        Tuple of (ref_reads, alt_reads)
+        Merged DataFrame with renamed columns:
+        - Target columns: target_ref, target_alt, target_depth
+        - Background columns: background_ref, background_alt, background_depth
+        - Shared columns: chr, pos, ref, alt, af (from target)
     """
-    if background_reads <= 0:
+    # Define the key columns for merging
+    merge_keys = ['chr', 'pos', 'ref', 'alt', 'af']
+    
+    # Rename columns before merging to distinguish target vs background
+    target_rename = {
+        'cfDNA_ref_reads': 'target_ref',
+        'cfDNA_alt_reads': 'target_alt',
+        'current_depth': 'target_depth'
+    }
+    background_rename = {
+        'cfDNA_ref_reads': 'background_ref',
+        'cfDNA_alt_reads': 'background_alt',
+        'current_depth': 'background_depth'
+    }
+    
+    target_renamed = target_df[merge_keys + list(target_rename.keys())].rename(
+        columns=target_rename
+    )
+    background_renamed = background_df[merge_keys + list(background_rename.keys())].rename(
+        columns=background_rename
+    )
+    
+    # Perform inner join on the key columns
+    merged = pd.merge(
+        target_renamed,
+        background_renamed,
+        on=merge_keys,
+        how='inner',
+        suffixes=('', '_bg')
+    )
+    
+    return merged
+
+
+def filter_valid_snps(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Filter to keep only SNPs where both target and background depths are > 0.
+    
+    Args:
+        df: Merged DataFrame with target_depth and background_depth columns.
+        
+    Returns:
+        Filtered DataFrame containing only SNPs with positive depths in both samples.
+    """
+    filtered = df[
+        (df['target_depth'] > 0) & (df['background_depth'] > 0)
+    ].copy()
+    
+    return filtered
+
+
+def calculate_target_reads_to_sample(
+    background_total: int,
+    target_ff: float,
+    background_ff: float,
+    mix_ff: float
+) -> int:
+    """
+    Calculate the total number of target reads (T_mix) needed to achieve mix_ff.
+    
+    Given:
+    - B_total = total background reads (kept as-is)
+    - T_mix = total target reads to sample
+    - target_ff = fetal fraction of target sample
+    - background_ff = fetal fraction of background sample
+    - mix_ff = desired fetal fraction of mixture
+    
+    The mixture fetal fraction is:
+    mix_ff = (T_mix * target_ff + B_total * background_ff) / (T_mix + B_total)
+    
+    Solving for T_mix:
+    T_mix = B_total * (mix_ff - background_ff) / (target_ff - mix_ff)
+    
+    Args:
+        background_total: Total number of background reads.
+        target_ff: Fetal fraction of the target sample.
+        background_ff: Fetal fraction of the background sample.
+        mix_ff: Desired fetal fraction of the mixture.
+        
+    Returns:
+        Total number of target reads to sample (T_mix).
+        
+    Raises:
+        ValueError: If the fetal fraction constraints are not met.
+    """
+    # Validate fetal fraction constraints
+    if not (background_ff < mix_ff < target_ff):
+        raise ValueError(
+            f"Fetal fraction constraints not met: "
+            f"background_ff ({background_ff}) < mix_ff ({mix_ff}) < target_ff ({target_ff})"
+        )
+    
+    # Calculate T_mix
+    numerator = background_total * (mix_ff - background_ff)
+    denominator = target_ff - mix_ff
+    
+    if denominator <= 0:
+        raise ValueError(
+            f"Invalid fetal fraction values: target_ff ({target_ff}) must be > mix_ff ({mix_ff})"
+        )
+    
+    T_mix = int(np.round(numerator / denominator))
+    
+    if T_mix <= 0:
+        raise ValueError(
+            f"Calculated T_mix ({T_mix}) must be positive. "
+            f"Check fetal fraction values."
+        )
+    
+    return T_mix
+
+
+def allocate_reads_across_snps(
+    df: pd.DataFrame,
+    total_reads: int,
+    rng: np.random.Generator
+) -> np.ndarray:
+    """
+    Allocate total reads across SNPs using depth-based weights.
+    
+    Uses a multinomial distribution to allocate reads proportionally to
+    each SNP's target depth. SNPs with higher depth receive more reads.
+    
+    Args:
+        df: DataFrame with target_depth column.
+        total_reads: Total number of reads to allocate.
+        rng: NumPy random number generator for reproducibility.
+        
+    Returns:
+        Array of allocated read counts per SNP (one per row in df).
+    """
+    # Calculate weights based on target depth
+    weights = df['target_depth'].values.astype(float)
+    
+    # Normalize weights to probabilities
+    weights = weights / weights.sum()
+    
+    # Use multinomial to allocate reads
+    # This gives us the number of reads to sample from each SNP
+    allocated = rng.multinomial(total_reads, weights)
+    
+    return allocated
+
+
+def sample_ref_alt_counts(
+    ref_count: int,
+    alt_count: int,
+    n_samples: int,
+    rng: np.random.Generator
+) -> Tuple[int, int]:
+    """
+    Sample ref and alt counts from a SNP using hypergeometric distribution.
+    
+    Given a SNP with ref_count reference reads and alt_count alternate reads,
+    sample n_samples reads without replacement. This is equivalent to a
+    hypergeometric distribution.
+    
+    Args:
+        ref_count: Number of reference reads in the target SNP.
+        alt_count: Number of alternate reads in the target SNP.
+        n_samples: Number of reads to sample from this SNP.
+        rng: NumPy random number generator for reproducibility.
+        
+    Returns:
+        Tuple of (sampled_ref_count, sampled_alt_count).
+    """
+    total = ref_count + alt_count
+    
+    # Edge cases
+    if n_samples == 0:
         return 0, 0
     
-    genotype = genotype_info['genotype']
-    alt_prob = genotype_info['alt_prob']
+    if n_samples >= total:
+        # Sample all reads
+        return ref_count, alt_count
     
-    try:
-        # For heterozygous sites, add variance by sampling from beta distribution
-        if genotype == '0/1':
-            # Beta distribution parameters for variance around 0.5
-            # alpha = beta = 20 gives reasonable variance while keeping mean at 0.5
-            alpha = 20
-            beta = 20
-            # Sample probability from beta distribution
-            sampled_prob = np.random.beta(alpha, beta)
-            # Ensure probability stays within reasonable bounds for heterozygous sites
-            sampled_prob = max(0.1, min(0.9, sampled_prob))
-            alt_reads = np.random.binomial(background_reads, sampled_prob)
-        else:
-            # For homozygous sites, use fixed probabilities
-            alt_reads = np.random.binomial(background_reads, alt_prob)
-
-        alt_reads = np.random.binomial(background_reads, alt_prob)
-        
-        ref_reads = background_reads - alt_reads
-        return max(0, ref_reads), max(0, alt_reads)
-    except (ValueError, OverflowError) as e:
-        # Fallback: deterministic assignment based on genotype
-        if genotype == '0/0':
-            return background_reads, 0
-        elif genotype == '0/1':
-            alt_reads = background_reads // 2
-            ref_reads = background_reads - alt_reads
-            return ref_reads, alt_reads
-        else:  # genotype == '1/1'
-            return 0, background_reads
+    if ref_count == 0:
+        # Only alt reads available
+        return 0, min(n_samples, alt_count)
+    
+    if alt_count == 0:
+        # Only ref reads available
+        return min(n_samples, ref_count), 0
+    
+    # Use hypergeometric distribution to sample without replacement
+    # Sample n_samples from total, where ref_count are "successes"
+    sampled_ref = rng.hypergeometric(
+        ngood=ref_count,      # number of ref reads (successes)
+        nbad=alt_count,       # number of alt reads (failures)
+        nsample=n_samples     # number of samples to draw
+    )
+    sampled_alt = n_samples - sampled_ref
+    
+    return int(sampled_ref), int(sampled_alt)
 
 
-def mix_single_combination(args: Tuple) -> str:
+def mix_pileups(
+    target_df: pd.DataFrame,
+    background_df: pd.DataFrame,
+    target_ff: float,
+    background_ff: float,
+    mix_ff: float,
+    random_seed: Optional[int] = None
+) -> pd.DataFrame:
     """
-    Perform mixing for a single ff-depth combination.
+    Perform in silico mixing of target and background pileups.
+    
+    This is the main mixing function that:
+    1. Merges target and background pileups
+    2. Filters to valid SNPs
+    3. Calculates how many target reads to sample
+    4. Allocates reads across SNPs
+    5. Samples ref/alt counts from target
+    6. Combines with background counts
     
     Args:
-        args: Tuple containing (ff, depth, repeat_idx, mixer_data, factor, output_prefix)
-    
+        target_df: DataFrame containing target pileup data.
+        background_df: DataFrame containing background pileup data.
+        target_ff: Fetal fraction of the target sample.
+        background_ff: Fetal fraction of the background sample.
+        mix_ff: Desired fetal fraction of the mixture.
+        random_seed: Random seed for reproducibility (optional).
+        
     Returns:
-        Output filename of the generated mixed pileup
+        DataFrame with mixed pileup data in the original format.
+    """
+    # Initialize random number generator
+    rng = np.random.default_rng(random_seed)
+    
+    # Step 1: Merge pileups
+    merged = merge_pileups(target_df, background_df)
+    
+    if merged.empty:
+        raise ValueError("No overlapping SNPs found between target and background files")
+    
+    # Step 2: Filter to valid SNPs (both depths > 0)
+    filtered = filter_valid_snps(merged)
+    
+    if filtered.empty:
+        raise ValueError("No valid SNPs found after filtering (both depths > 0)")
+    
+    # Step 3: Calculate total background reads and target reads to sample
+    background_total = filtered['background_depth'].sum()
+    T_mix = calculate_target_reads_to_sample(
+        background_total, target_ff, background_ff, mix_ff
+    )
+    
+    # Step 4: Allocate T_mix reads across SNPs using depth-based weights
+    allocated_reads = allocate_reads_across_snps(
+        filtered, T_mix, rng=rng
+    )
+    
+    # Step 5: Sample ref/alt counts from target for each SNP
+    sampled_ref = []
+    sampled_alt = []
+    
+    for idx, row in filtered.iterrows():
+        n_samples = allocated_reads[filtered.index.get_loc(idx)]
+        ref, alt = sample_ref_alt_counts(
+            row['target_ref'],
+            row['target_alt'],
+            n_samples,
+            rng=rng
+        )
+        sampled_ref.append(ref)
+        sampled_alt.append(alt)
+    
+    # Step 6: Combine sampled target counts with background counts
+    result = filtered[['chr', 'pos', 'ref', 'alt', 'af']].copy()
+    result['cfDNA_ref_reads'] = (
+        filtered['background_ref'].values + np.array(sampled_ref)
+    )
+    result['cfDNA_alt_reads'] = (
+        filtered['background_alt'].values + np.array(sampled_alt)
+    )
+    result['current_depth'] = (
+        result['cfDNA_ref_reads'] + result['cfDNA_alt_reads']
+    )
+    
+    return result
+
+
+def write_pileup(df: pd.DataFrame, output_path: str) -> None:
+    """
+    Write pileup DataFrame to a gzipped TSV file.
+    
+    Args:
+        df: DataFrame containing pileup data.
+        output_path: Path to the output file (will be gzipped).
+        
+    Raises:
+        IOError: If the file cannot be written.
     """
     try:
-        ff, depth, repeat_idx, mixer_data, factor, output_prefix, model_acc = args
-        
-        filtered_target, filtered_background, background_genotypes = mixer_data
-        
-        # Validate inputs
-        if len(filtered_target) == 0:
-            raise ValueError("No target data available for mixing")
-        if depth <= 0:
-            raise ValueError(f"Invalid depth: {depth}")
-        if not (0 <= ff <= 1):
-            raise ValueError(f"Invalid fetal fraction: {ff}")
-        
-        # Calculate reads distribution
-        n_snps = len(filtered_target)
-        n_total_reads = n_snps * depth
-        n_target_reads = int(n_total_reads * ff)
-        n_background_reads = n_total_reads - n_target_reads
-        
-        # Distribute reads proportionally to original depths
-        total_target_depth = filtered_target['current_depth'].sum()
-        total_background_depth = filtered_background['current_depth'].sum()
-
-        filtered_df = pd.merge(filtered_target, 
-                               filtered_background, 
-                               on=['chr_pos', 'chr', 'pos', 'ref', 'alt', 'af'], 
-                               how='inner', 
-                               suffixes=('_target', '_background'))
-        
-        if total_target_depth <= 0:
-            raise ValueError("Total target depth is zero or negative")
-        
-        results = []
-        
-        for _, row in filtered_df.iterrows():
-            chr_pos = row['chr_pos']
-            
-            # Calculate target reads for this SNP
-            target_proportion = row['current_depth_target'] / total_target_depth
-            snp_target_reads = int(n_target_reads * target_proportion)
-
-            background_proportion = row['current_depth_background'] / total_background_depth
-            snp_background_reads = int(n_background_reads * background_proportion)
-            
-            # Sample target reads
-            target_ref, target_alt = sample_target_reads(row, snp_target_reads)
-            
-            # Sample background reads
-            background_genotype = background_genotypes[chr_pos]
-            background_ref, background_alt = sample_background_reads(background_genotype, snp_background_reads)
-            
-            # Combine reads
-            final_ref = target_ref + background_ref
-            final_alt = target_alt + background_alt
-            final_depth = final_ref + final_alt
-
-            # Use model accuracy to classify target reads
-            fetal_ref = int(target_ref * model_acc + background_ref * (1 - model_acc))
-            fetal_alt = int(target_alt * model_acc + background_alt * (1 - model_acc))
-            
-            results.append({
-                'chr': row['chr'],
-                'pos': row['pos'],
-                'ref': row['ref'],
-                'alt': row['alt'],
-                'af': row['af'],
-                'cfDNA_ref_reads': final_ref,
-                'cfDNA_alt_reads': final_alt,
-                'current_depth': final_depth,
-                'fetal_ref_reads_from_model': fetal_ref,
-                'fetal_alt_reads_from_model': fetal_alt
-            })
-        
-        # Create output dataframe and save
-        output_df = pd.DataFrame(results)
-        output_filename = f"{output_prefix}/Mix_{ff:.3f}_{depth}_{factor}_{repeat_idx}_pileup.tsv.gz"
-        
-        # Ensure output directory exists
-        os.makedirs(os.path.dirname(output_filename), exist_ok=True)
-        
-        # Save to compressed TSV
-        output_df.to_csv(output_filename, sep='\t', compression='gzip', index=False)
-        
-        return output_filename
-        
+        with gzip.open(output_path, 'wt') as f:
+            df.to_csv(f, sep='\t', index=False)
     except Exception as e:
-        # Log detailed error information for debugging
-        error_msg = f"Error in mixing ff={ff}, depth={depth}, repeat={repeat_idx}: {str(e)}"
-        logger.error(error_msg)
-        raise ValueError(error_msg)
+        raise IOError(f"Error writing output file {output_path}: {e}")
 
 
 @click.command()
-@click.option('--target', required=True, help='Target pileup file (tsv.gz format)')
-@click.option('--background', required=True, help='Background pileup file (tsv.gz format)')
-@click.option('--tsv', required=True, help='SNP sites file (tsv format)')
-@click.option('--factor', required=True, help='Factor string for output files')
-@click.option('--ff-min', type=float, required=True, help='Minimum fetal fraction')
-@click.option('--ff-max', type=float, required=True, help='Maximum fetal fraction')
-@click.option('--ff-number', type=int, required=True, help='Number of fetal fraction values')
-@click.option('--depth-min', type=int, required=True, help='Minimum sequencing depth')
-@click.option('--depth-max', type=int, required=True, help='Maximum sequencing depth')
-@click.option('--depth-number', type=int, required=True, help='Number of depth values')
-@click.option('--repeat', type=int, default=1, help='Number of repeats for each combination')
-@click.option('--output-prefix', required=True, help='Output directory prefix')
-@click.option('--threads', type=int, default=None, help='Number of threads (default: CPU count)')
-@click.option('--seed', type=int, default=42, help='Random seed for reproducibility')
-@click.option('--model-acc', type=float, default=0.81, help='Model accuracy for target reads classification')
-def main(target: str, background: str, tsv: str, factor: str,
-         ff_min: float, ff_max: float, ff_number: int,
-         depth_min: int, depth_max: int, depth_number: int,
-         repeat: int, output_prefix: str, threads: Optional[int], seed: int, 
-         model_acc: float) -> None:
+@click.option(
+    '--target',
+    required=True,
+    type=click.Path(exists=True),
+    help='Path to the target pileup file (e.g., PL sample).'
+)
+@click.option(
+    '--background',
+    required=True,
+    type=click.Path(exists=True),
+    help='Path to the background pileup file (e.g., cfDNA sample).'
+)
+@click.option(
+    '--target_ff',
+    required=True,
+    type=float,
+    help='Fetal fraction of the target sample (float, e.g., ~0.9).'
+)
+@click.option(
+    '--background_ff',
+    required=True,
+    type=float,
+    help='Fetal fraction of the background sample (float, e.g., ~0.03).'
+)
+@click.option(
+    '--mix_ff',
+    required=True,
+    type=float,
+    help='Desired fetal fraction for the final mixture (float).'
+)
+@click.option(
+    '--output_prefix',
+    required=True,
+    type=str,
+    help='Prefix for the output file name.'
+)
+@click.option(
+    '--seed',
+    type=int,
+    default=None,
+    help='Random seed for reproducibility (optional).'
+)
+def main(
+    target: str,
+    background: str,
+    target_ff: float,
+    background_ff: float,
+    mix_ff: float,
+    output_prefix: str,
+    seed: Optional[int]
+) -> None:
     """
-    SNP Pileup Mixing Tool
+    Perform in silico mixing of pileup files.
     
-    Mix target and background pileup data to simulate various fetal fraction
-    and sequencing depth combinations for downstream analysis.
+    This script mixes two pileup files (target and background) to achieve
+    a desired fetal fraction in the final mixture. The mixing is performed
+    by keeping all background reads and sampling an appropriate number of
+    target reads based on the desired mixture fetal fraction.
     
     Example:
-        python mix_pileup.py --target target.tsv.gz --background bg.tsv.gz 
-        --tsv snps.tsv --factor test --ff-min 0.05 --ff-max 0.15 --ff-number 3
-        --depth-min 100 --depth-max 300 --depth-number 3 --repeat 2 
-        --output-prefix ./output
+        python mix_pileup.py \\
+            --target target.pileup.tsv.gz \\
+            --background background.pileup.tsv.gz \\
+            --target_ff 0.9 \\
+            --background_ff 0.03 \\
+            --mix_ff 0.15 \\
+            --output_prefix mixed_sample \\
+            --seed 42
     """
-    
-    # Set random seed for reproducibility
-    random.seed(seed)
-    np.random.seed(seed)
-    
-    # Determine number of threads
-    if threads is None:
-        threads = mp.cpu_count()
-    
-    console.print(f"[bold blue]SNP Pileup Mixing Tool[/bold blue]")
-    console.print(f"Using {threads} threads with random seed {seed}")
-    
     try:
-        # Initialize mixer and load data
-        mixer = PileupMixer(target, background, tsv)
-        mixer.load_data()
-        mixer.filter_data()
-        mixer.genotype_background()
-        
-        # Generate parameter combinations
-        ff_values = np.linspace(ff_min, ff_max, ff_number)
-        depth_values = np.linspace(depth_min, depth_max, depth_number, dtype=int)
-        
-        # Prepare all combinations
-        combinations = []
-        for ff in ff_values:
-            for depth in depth_values:
-                for repeat_idx in range(repeat):
-                    mixer_data = (mixer.filtered_target, mixer.filtered_background, mixer.background_genotypes)
-                    combinations.append((ff, depth, repeat_idx, mixer_data, factor, output_prefix, model_acc))
-        
-        total_combinations = len(combinations)
-        console.print(f"[blue]Generating {total_combinations:,} mixed pileup files...[/blue]")
-        
-        # Execute mixing with progress tracking
-        with Progress() as progress:
-            task = progress.add_task("[cyan]Mixing pileups...", total=total_combinations)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            TaskProgressColumn(),
+            console=console
+        ) as progress:
+            # Read target pileup
+            task1 = progress.add_task("Reading target pileup...", total=None)
+            target_df = read_pileup(target)
+            progress.update(task1, completed=True)
+            console.print(f"[green]✓[/green] Read {len(target_df)} SNPs from target file")
             
-            with ProcessPoolExecutor(max_workers=threads) as executor:
-                # Submit all jobs
-                futures = [executor.submit(mix_single_combination, combo) for combo in combinations]
-                
-                # Process completed jobs
-                completed_files = []
-                for future in as_completed(futures):
-                    try:
-                        output_file = future.result()
-                        completed_files.append(output_file)
-                        progress.update(task, advance=1)
-                    except Exception as e:
-                        logger.error(f"Error in mixing process: {e}")
-                        progress.update(task, advance=1)
+            # Read background pileup
+            task2 = progress.add_task("Reading background pileup...", total=None)
+            background_df = read_pileup(background)
+            progress.update(task2, completed=True)
+            console.print(f"[green]✓[/green] Read {len(background_df)} SNPs from background file")
+            
+            # Perform mixing
+            task3 = progress.add_task("Mixing pileups...", total=None)
+            mixed_df = mix_pileups(
+                target_df,
+                background_df,
+                target_ff,
+                background_ff,
+                mix_ff,
+                random_seed=seed
+            )
+            progress.update(task3, completed=True)
+            console.print(f"[green]✓[/green] Mixed {len(mixed_df)} SNPs")
+            
+            # Write output
+            output_path = f"{output_prefix}_pileup.tsv.gz"
+            task4 = progress.add_task("Writing output...", total=None)
+            write_pileup(mixed_df, output_path)
+            progress.update(task4, completed=True)
+            console.print(f"[green]✓[/green] Output written to {output_path}")
         
-        console.print(f"[bold green]✓ Successfully generated {len(completed_files):,} mixed pileup files[/bold green]")
-        console.print(f"Output files saved to: {output_prefix}")
+        # Print summary statistics
+        console.print("\n[bold]Summary Statistics:[/bold]")
+        console.print(f"  Total SNPs in mixture: {len(mixed_df):,}")
+        console.print(f"  Total depth: {mixed_df['current_depth'].sum():,}")
+        console.print(f"  Mean depth per SNP: {mixed_df['current_depth'].mean():.2f}")
+        console.print(f"  Median depth per SNP: {mixed_df['current_depth'].median():.2f}")
         
     except Exception as e:
-        console.print(f"[bold red]Error: {e}[/bold red]")
-        raise click.ClickException(str(e))
+        console.print(f"[bold red]Error:[/bold red] {e}", err=True)
+        sys.exit(1)
 
 
 if __name__ == '__main__':
     main()
+
